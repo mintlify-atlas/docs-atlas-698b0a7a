@@ -1,5 +1,5 @@
 ---
-title: "MCP Tool Reference for Decomp Agent"
+title: "MCP Tool Reference: Decomp Agent Server Tool Catalog"
 sidebarTitle: "MCP Tools"
 description: "Complete reference for the MCP tools exposed by the decomp agent server: health, candidates, context, compile_diff, sessions, verification, and promotion."
 ---
@@ -242,8 +242,9 @@ Records a structured blocker for a target with a kind, confidence level, and sup
 | `remaining_mismatch` | `string \| null` | Description of the remaining delta |
 | `recommended_human_action` | `string \| null` | Suggested human follow-up |
 | `recommended_tooling_action` | `string \| null` | Suggested tooling fix |
+| `client` | `string \| null` | Recording client identifier |
 
-**Common blocker kinds:** `assembler_normalization` (SN `as` hazard nop not reproduced by the decompals `as` — temporary, fix belongs in gen_hybrid), `architectural` (override any kind to drop from ranking), `bss_common` (uninitialised data outside a complete unit), `data_section_mismatch`, `register_allocation`, `missing_type_layout`, `unknown_prototype`, `assembly_origin`, `compiler_private_partial_unit`, `toolchain_failure`.
+**Common blocker kinds:** `assembler_normalization` (SN `as` hazard nop not reproduced by the decompals `as` — temporary, fix belongs in gen_hybrid), `bss_common` (uninitialised data outside a complete unit), `data_section_mismatch`, `missing_type_layout`, `unknown_prototype`, `assembly_origin`, `compiler_private_partial_unit`, `toolchain_failure`. Pass `architectural = true` to override a kind’s default architectural flag and drop the function from candidate ranking.
 
 <Warning>
 Never record a blocker without first calling `get_disassembly` for the function. A blocker is a *proven* pipeline limit visible in the disassembly or compile output. "It didn't match from the reference" is not a blocker. Jump tables, `.lit4`/`.lit8` constants, and `li.d` GPR pools are all supported — they are not blockers.

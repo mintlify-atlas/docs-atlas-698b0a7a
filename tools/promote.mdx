@@ -91,7 +91,7 @@ On a unit that is already `complete`, re-running `--complete` refreshes the clai
 
 ## Compiler Profiles
 
-`promote.py` selects the correct compiler profile for a unit automatically. Game and engine code compiles under the SN ProDG compiler (profile `default`); Sony runtime units use the Sony compiler (profile `sce`). An explicit `--profile` flag overrides the default.
+`promote.py` selects the correct compiler profile for a unit automatically when creating a new manifest. Game and engine code compiles under the SN ProDG compiler (profile `default`); Sony runtime units use the Sony compiler (profile `sce`). An explicit `--profile` flag overrides the automatic selection and is only accepted together with `--init`.
 
 <Note>
   `equivalent` is a human review decision and is **never** set by `promote.py`. Only `asm` → `matching` transitions are automated; `equivalent` states must be set by hand after a human judgment call.

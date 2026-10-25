@@ -1,7 +1,7 @@
 ---
 title: "Symbol Registries: Functions, Data, and Debug Info"
 sidebarTitle: "Registries"
-description: "How symbol registries are extracted from the retail .mdebug ECOFF debug section and .symtab, and what each registry file contains."
+description: "How symbol registries are extracted from the retail .mdebug ECOFF debug section and .symtab, covering what each registry file contains."
 ---
 
 The retail `SLES_503.86` executable ships a complete MIPS ECOFF debug section — `.mdebug`, magic `0x7009` — that describes every translation unit and procedure in the program, including their virtual addresses, stack-frame sizes, and saved-register masks. Because the game's ELF was never stripped, this information is authoritative and exhaustive. The project extracts it deterministically into committed registry files that every later pipeline stage depends on; nothing is guessed or inferred.

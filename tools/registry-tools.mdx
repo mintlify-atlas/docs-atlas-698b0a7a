@@ -7,7 +7,7 @@ description: "Tools for extracting, verifying, and checking the symbol registrie
 All registries in this project are pure, deterministic functions of the retail ELF. They are never hand-edited: each extraction tool reads the binary in native table order and writes committed files that later tooling — splat, the TU split, objdiff, the verifier — builds on. Every tool that produces a registry also has a `--check` mode that verifies the committed file exactly matches a fresh extraction, providing a byte-level guarantee that the registry has not drifted from the binary.
 
 <Note>
-  All registry checks (`--check` flags below) need the game files at `orig/pal103/`. They run without a toolchain and are part of the `validate.yml` CI gate on every push.
+  The extraction and target-verification checks (`extract_mdebug.py --check`, `extract_data_symbols.py --check`, `extract_data_map.py --check`, `verify_target.py`) need the game files at `orig/pal103/`. `status.py --check` needs no game files. All run without a toolchain and are part of the `validate.yml` CI gate on every push.
 </Note>
 
 ## Symbol Registries

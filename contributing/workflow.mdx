@@ -1,7 +1,7 @@
 ---
-title: "Contributing to CrashWOC: Day-to-Day Workflow"
+title: "Day-to-Day Workflow: CrashWOC Decomp PS2 Contribution"
 sidebarTitle: "Workflow"
-description: "Learn the day-to-day contributor workflow: rebuilding units, reading match tables, auto-promotion, and creating status manifests."
+description: "Learn the day-to-day contributor workflow: rebuilding units, reading match tables, triggering auto-promotion, and creating status manifests."
 ---
 
 All day-to-day contributor work goes through a single entry-point script, `decomp.py`. You should not need to call the internal tools directly — the wrapper handles dispatching into the container, refreshing the report, and running promotion automatically. The sections below walk through every action you will take on a typical contribution day.
@@ -78,7 +78,7 @@ Any function whose `Match` column reaches **100%** while still in `asm` state is
 If you want to inspect the table after a rebuild without triggering promotion, pass `--no-promote`:
 
 ```bash
-python decomp.py --no-promote src/game/creature.c
+python decomp.py src/game/creature.c --no-promote
 ```
 
 ## Creating an initial manifest

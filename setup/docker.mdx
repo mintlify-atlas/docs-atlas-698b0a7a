@@ -1,7 +1,7 @@
 ---
-title: "Docker Setup for CrashWOC Decomp PS2"
+title: "Docker Setup for CrashWOC Decomp PS2 Decompilation"
 sidebarTitle: "Docker"
-description: "Set up the CrashWOC Decomp PS2 decompilation environment using Docker or Podman. Works on any OS including Windows and macOS."
+description: "Set up the CrashWOC Decomp PS2 decompilation environment using Docker or Podman. Works on any OS, including Windows and macOS without WSL2."
 ---
 
 The CrashWOC Decomp PS2 matching toolchain consists of Linux-only EE GCC binaries that cannot run directly on Windows or macOS. Docker (or Podman) solves this by running those binaries inside a pre-built container image, while your editor and Python scripts stay on the host. Three idempotent commands take you from a fresh clone to a working objdiff session, and `tools/dispatch.py` transparently routes every toolchain invocation into the running container so you never need to manage it manually.
