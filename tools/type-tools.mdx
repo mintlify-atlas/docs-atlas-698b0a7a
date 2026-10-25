@@ -1,0 +1,113 @@
+---
+title: "Type Checking and Codegen Verification Tools"
+sidebarTitle: "Type Tools"
+description: "Tools for enforcing type consistency across shared headers, verifying codegen is unchanged after refactors, and measuring struct layouts against the compiler."
+---
+
+Four tools gate type work and keep shared headers consistent across the codebase. Because every unit currently carries its own copy of the structs, typedefs, externs, and prototypes it needs, the same type is often defined many times — sometimes with different layouts or names. These tools count, measure, and verify the type landscape so that improvements are ratcheted in rather than regressed, and refactors are proven to leave generated code unchanged.
+
+## Tools
+
+<Accordion title="tools/check_types.py — type census and ratchet">
+  Counts the type problems that block shared headers and a 64-bit build. Every metric is ratcheted: counts can only go down, and an improvement must be recorded in the same commit that made it.
+
+  Metrics tracked:
+
+  | Metric | What it counts |
+  |---|---|
+  | `struct_redefinitions` | struct/union tags defined in more than one file (value = definitions beyond the first) |
+  | `typedef_redefinitions` | typedef names defined in more than one file |
+  | `long_types` | `long` that is not `long long` (64-bit on the EE, 32-bit on Win64 and in o32 type tools) |
+  | `varargs_hacks` | files with a local `__builtin_args_info` va_start |
+  | `offset_casts` | byte-offset pointer arithmetic, e.g. `(char *)p + 0x10` or `(T *)((u32)p + 0x10)` |
+  | `sizeof_pads` | struct members whose array size uses `sizeof` (the layout breaks once the inner struct grows) |
+  | `libc_prototypes` | local prototypes of C library functions |
+  | `extern_conflicts` | globals declared `extern` with different types |
+  | `prototype_conflicts` | functions declared with different signatures |
+  | `misplaced_headers` | headers outside the `include/` layout |
+
+  ```bash
+  python tools/check_types.py                        # summary + top files
+  python tools/check_types.py --check                # fail if count differs from config/type_census.toml
+  python tools/check_types.py --update               # record updated counts (use in same commit)
+  python tools/check_types.py --metric long_types    # list every site of one metric
+  python tools/check_types.py --json
+  ```
+
+  CI (`validate.yml`) runs `--check` against `config/type_census.toml`. The check fails when **any** count changes in either direction — an improvement is only accepted once it is recorded with `--update` in the same commit.
+
+  Scope: `src/` and `include/`, except `src/sdk/` (the Sony runtime keeps its own headers). Runs anywhere with stdlib only — no game files needed.
+</Accordion>
+
+<Accordion title="tools/check_codegen.py — prove a refactor changed no code">
+  Snapshots the compiled objects and proves a header or type refactor left their code unchanged. `ninja check` only covers `matching` functions; this tool covers everything — near-matches, `asm`-state C bodies scored by objdiff, and all four object sets.
+
+  Per object it records, independent of line numbers and file names:
+
+  - Every allocated section (name, type, size, and a hash of its bytes unless NOBITS)
+  - Every relocation against an allocated section (offset, type, target symbol name)
+  - Defined and undefined symbols (name, section, value, size, type, binding), order-independent
+  - Per function symbol, a hash of its bytes plus the relocations inside it
+
+  Non-allocated sections (`.mdebug`, `.comment`, `.pdr`) are ignored — they carry line and file information that a header edit shifts without touching code.
+
+  ```bash
+  python tools/check_codegen.py --build --snapshot   # snapshot before the refactor
+  python tools/check_codegen.py --build --compare    # compare after (must report 0 objects differ)
+  ```
+
+  The object list is read from the phony targets in `build.ninja` (`current`, `matching`, `equivalent`, `report-current`), so stale files in `build/` never count.
+</Accordion>
+
+<Accordion title="tools/probe_layout.py — measure struct layouts with the compiler">
+  Compiles `sizeof`/offset probes of every commented struct member using the matching compiler and reports each `/* 0x.. */` comment that disagrees with the compiler's actual measurement. Also reports headers that do not compile on their own.
+
+  Run via `tools/dispatch.py` to route into the dev container:
+
+  ```bash
+  python tools/dispatch.py python tools/probe_layout.py --check
+  python tools/dispatch.py python tools/probe_layout.py --check include/game/gametypes.h
+  ```
+
+  A `/* 0x.. */` trailing comment on a struct member, a `}; /* 0x.. */` size comment, or a `// Offset: 0x..` / `// Size: 0x..` comment is checked against what the compiler actually measures. Any disagreement is reported. Legacy root headers are reported but do not fail `--check`.
+</Accordion>
+
+<Accordion title="tools/merge_views.py — unify local struct copies">
+  Measures every local copy of a struct across the codebase and prints sizes, distinct layouts, and field names that differ at the same offset. The starting point for unifying a struct that appears in multiple translation units.
+
+  Run via `tools/dispatch.py`:
+
+  ```bash
+  python tools/dispatch.py python tools/merge_views.py <tag> [alias...]
+  ```
+
+  Bit-fields are measured by bit position. The output names the module that owns the struct (the starting point for naming fields), lists alias names, and highlights offsets where two copies disagree on type or name.
+</Accordion>
+
+## Type Refactor Rules
+
+Follow these rules when moving types into shared headers or merging local copies:
+
+1. Moving or renaming types, `extern` declarations, or prototypes changes no code: `check_codegen.py --compare` must end at **0 objects differ**.
+2. Offsets and sizes of a struct moving into a shared header are measured with the compiler (`probe_layout.py --check`), not taken from comments. Every header must compile on its own. New headers write offsets as trailing `/* 0x.. */` comments and the size as `}; /* 0x.. */`.
+3. A unit's local copy of a tag is removed in the **same commit** that includes the header defining it.
+4. `long` is 8 bytes under both compilers (pointers are 4 bytes). Replace it with `s64`/`u64`, never `int`.
+5. Headers hold types, `extern` declarations, and prototypes only — no alias `#define`s. A readable alias like `#define fseed D_0062EA68` would rename every `fseed` in every includer; keep it in the `.c` file.
+
+## `include/` Layout
+
+All shared headers live under `include/`. The layout mirrors the engine's own module structure:
+
+| Path | Holds |
+|---|---|
+| `include/nu_types.h`, `nu_stdarg.h`, `nu_libc.h`, `nu_port.h` | Platform layer: fixed-width types (`u8`..`s64`, `u128`, `f32`, `nuintptr`), varargs, libc, port seams |
+| `include/<lib>/<lib>types.h` | Structs shared by several modules of one library (e.g. `game/gametypes.h`) |
+| `include/<lib>/<module>.h` | One per `src/<lib>/<module>.c`: that module's structs, `extern` globals, and prototypes |
+
+Include headers by path from the repo root (`#include "nu3d/nugscn.h"`, `#include "nu_types.h"`). `tools/cc.py` stages the tree and passes `-I.`. A module header is created when something needs it, not as an empty skeleton. A module's `.c` includes its own header; callers include it instead of declaring functions locally.
+
+Types are spelled by their struct tag (`struct numtx_s`), not through typedef aliases.
+
+<Tip>
+  Use `python tools/check_types.py --metric struct_redefinitions` to list every file that defines a duplicated struct, and `python tools/dispatch.py python tools/merge_views.py <tag>` to see the distinct layouts side by side before choosing how to unify them.
+</Tip>

@@ -1,47 +1,124 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Started with CrashWOC Decomp PS2"
+sidebarTitle: "Quickstart"
+description: "Go from zero to your first rebuilt translation unit in three commands. Covers Docker setup, workspace initialization, and working on your first unit."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
+CrashWOC Decomp PS2 uses a single entry-point script — `decomp.py` — for every day-to-day operation: building the container, setting up the workspace, and rebuilding individual translation units. You do not need to invoke internal tools directly. This guide walks through the Docker-based setup path, which works on any operating system, and then shows you exactly what rebuilding a unit looks like once you are up and running.
 
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
+<Note>
+You must own a legal copy of **Crash Bandicoot: The Wrath of Cortex (PAL retail v1.03)**. The repository contains no game assets; all original files are supplied by you from your own disc and are never committed to the repository.
+</Note>
 
 ## Prerequisites
 
-Before you begin, you must have:
+Before running any setup command, make sure you have the following:
 
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
+- **Python 3.12+** on your host machine.
+- **Docker or Podman** (Option A — any OS) **or** a native Linux / WSL2 environment (Option B).
+- Your own legal copy of the game, ready to be placed at `orig/pal103/` — see Step 1 below for the exact files and hashes required.
 
-## Get started
+## Setup: Option A — Docker / Podman (Recommended)
+
+The matching toolchain is Linux-only. Running it in a container means the three-command workflow works on macOS, Windows, and Linux alike. All three commands are safe to re-run; `setup` only rebuilds what changed.
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
+  <Step title="Place your game files at orig/pal103/">
+    Create the directory `orig/pal103/` at the repository root and copy in the two required files from your own legal copy of the game. Both files are verified against exact hashes before any build step proceeds:
 
-    ```bash
-    npm install your-package
-    ```
+    | File | Size (bytes) | SHA-256 |
+    |---|---|---|
+    | `SLES_503.86` | 6,731,763 | `7fc6826d08c42a5a92fc018edae3e520783beb5a8330410251192bfe26b1eca1` |
+    | `SYSTEM.CNF` | 56 | `86fe327e4576516f57004800b2663c75c8a65a62872f3fdf3aa0618daf23d9c1` |
+
+    These files are listed in `.gitignore` and will never be committed to the repository.
   </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
-
+  <Step title="Build the container and install the locked toolchain">
     ```bash
-    your-cli init
+    python decomp.py toolchain
     ```
+
+    This command builds the Docker image from the repository `Containerfile`, starts the dev container, downloads the locked toolchain components (both compilers, `wibo`, `ps2-binutils`, `objdiff-cli`), verifies each archive against its locked SHA-256, and validates every installed compiler file against its recorded fingerprint manifest. A cold run takes roughly 5–10 minutes; subsequent runs are incremental.
   </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
-
+  <Step title="Set up the workspace">
     ```bash
-    your-cli start
+    python decomp.py setup
     ```
+
+    This command verifies your `orig/pal103/` files against the committed registry, runs `splat split` to disassemble the ELF into per-section assembly (in the gitignored `asm/` and `build/` directories), builds the objdiff expected objects, runs the verification pipeline, and generates the match report. When it finishes, an `objdiff.json` is ready at the repository root.
+  </Step>
+  <Step title="Open the repository in the objdiff GUI">
+    Open the repository root in the **objdiff GUI** to get live per-function match feedback as you edit source files. The GUI reads `objdiff.json` and shows you a real-time diff of your compiled output versus the retail bytes for every function in every translation unit.
+
+    The pinned CLI version used by the build is `objdiff 3.7.2`. Download the GUI for your platform from the [objdiff releases page](https://github.com/encounter/objdiff/releases).
   </Step>
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+## Setup: Option B — Native Linux / WSL2
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
-</Tip>
+If you are on Linux or WSL2 and want to skip the container, you can run the toolchain directly. macOS and plain Windows (without WSL2) must use Option A — the toolchain binaries are Linux ELFs.
+
+```bash
+python -m pip install -r requirements.txt -r requirements-mcp.txt   # splat + MCP SDK
+sudo dpkg --add-architecture i386                                    # 32-bit compiler needs i386 libs
+sudo apt-get update && sudo apt-get install -y libc6:i386 libstdc++6:i386 zlib1g:i386
+python tools/setup_toolchain.py --download                           # fetch + verify the locked toolchain
+export CRASHWOC_DIRECT=1                                             # run the toolchain natively, no container
+python decomp.py setup
+```
+
+Setting `CRASHWOC_DIRECT=1` tells `tools/dispatch.py` to run toolchain commands in place instead of forwarding them into the container. You can also skip local byte work entirely and let CI run the byte gates on your pushed branch.
+
+## Working on a Translation Unit
+
+Once setup is complete, rebuild any single translation unit and print its per-function match table with one command:
+
+```bash
+python decomp.py src/game/creature.c
+```
+
+This recompiles the unit, refreshes the match report, and prints a table like the following:
+
+```text
+Unit: game/creature
+Compiler: default
+
+Function                  Match      State         Verified
+----------------------------------------------------------------
+CreatureInit              100.00%    matching      yes
+CreatureUpdate             96.42%    asm           no
+CreatureDraw               73.18%    asm           no
+
+Unit fuzzy progress:       89.31%
+Verified matching:          1 / 3
+```
+
+The three columns tell you everything you need to know about the state of each function:
+
+- **Match** — the objdiff fuzzy percentage. This is the measurement CI and [decomp.dev](https://decomp.dev) display. It is a useful guide while you are working, but it is never accepted as proof of a byte match.
+- **State** — the committed state in the unit's status manifest: `asm` (still using retail assembly), `equivalent` (human-reviewed as semantically correct but not yet byte-proven), or `matching` (byte-exact, proven by the verification pipeline).
+- **Verified** — the canonical truth. `yes` means the bytes were re-derived end-to-end and proven identical to retail. Only `tools/promote.py` can set a function to `matching`, and only after it passes the full byte gate.
+
+## Auto-Promotion
+
+Any function that reaches **100%** match while its manifest state is still `asm` is **automatically promoted** when you run `decomp.py`. The `tools/promote.py` wrapper runs the real byte-plus-image verification and writes `state = "matching"` only if the bytes pass — rolling back to `asm` otherwise. To inspect a 100% function without triggering promotion, pass `--no-promote`:
+
+```bash
+python decomp.py src/game/creature.c --no-promote
+```
+
+If a translation unit has no manifest yet, create one before working on it:
+
+```bash
+python tools/promote.py --init src/<group>/<unit>.c
+```
+
+<Warning>
+**Never hand-edit a manifest to `state = "matching"`**. Only `tools/promote.py` writes that value, after byte verification. Setting it by hand will be caught by `tools/status.py --check` (which CI runs on every push) and will cause the validation workflow to fail. The `equivalent` state is a human review decision and may be set manually, but `matching` never is.
+</Warning>
+
+## Next Steps
+
+- **Full Docker setup details** — see the [Setup: Docker](/setup/docker) guide for container image pinning, updating digests, and troubleshooting.
+- **Native Linux setup details** — see the [Setup: Native](/setup/native) guide for the full native workflow and CI integration.
+- **Pipeline internals** — `docs/pipeline.md` in the repository documents the complete reconstruction pipeline, from symbol registry extraction through hybrid object generation and the byte-gate CI workflow.

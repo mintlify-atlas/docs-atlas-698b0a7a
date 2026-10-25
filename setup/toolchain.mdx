@@ -1,0 +1,90 @@
+---
+title: "Toolchain Components and Pinning"
+sidebarTitle: "Toolchain"
+description: "The locked toolchain components used by CrashWOC Decomp PS2: two EE GCC compilers, PS2 binutils, splat, and objdiff — all pinned by SHA-256."
+---
+
+The retail ELF of *Crash Bandicoot: The Wrath of Cortex* was built by two distinct EE GCC compilers, and byte-exact matching requires using both — each for the half of the program it actually compiled. Every component in the toolchain is pinned by version and SHA-256 in `toolchain.lock.json`, and every installed file is additionally verified byte-for-byte against a recorded fingerprint manifest. This double-anchoring means a same-version reinstall that would silently change codegen is always caught before it contaminates a matching result.
+
+## Two compilers, two halves
+
+Which compiler a translation unit uses is determined by a named **profile** in `config/pal103/profiles.toml`. A unit compiles with `default` unless its status manifest names a different profile:
+
+| Profile | Compiler | Covers |
+|---|---|---|
+| `default` | `ee-gcc-tt` 2.95.2-EE (SN ProDG) | game and Nu-engine translation units |
+| `sce` | `ee-gcc` 2.9-ee-991111-01 | Sony runtime (SCE libraries, newlib, libgcc, CRT) |
+
+The game and engine translation units **cannot match** under the Sony 2.9 build. The Sony compiler uses `sd`/`ld` callee saves and inserts R5900 short-loop padding that the retail game TUs do not contain. The SN ProDG `ee-gcc-tt` 2.95.2-EE reproduces those TUs correctly — using `sq`/`lq` callee saves at 16-byte slots with no short-loop padding — which is why it is the `default` profile.
+
+Conversely, the Sony runtime half (newlib, libgcc, SCE units) was compiled by the Sony toolchain and matches only under `ee-gcc` 2.9-ee-991111-01.
+
+### Compiler flags
+
+| Profile | Flags |
+|---|---|
+| `default` | `-O2 -G8 -fomit-frame-pointer` |
+| `sce` | `-O2 -G0 -fomit-frame-pointer` |
+
+The `sce` profile uses `-G0` because the retail Sony SDK half places no small-data globals in `.sdata` — its 4-byte initialised globals sit in `.data` and its `$LC` constants in `.rodata`. Only `-G0` reproduces libm's data bytes correctly. `gen_hybrid` assembles every unit with its profile's `-G` flag.
+
+## Full toolchain table
+
+Every component is pinned in `toolchain.lock.json`:
+
+| Component | Version | Role |
+|---|---|---|
+| `ee-gcc-tt` | 2.95.2-EE (SN ProDG) | `default` matching compiler (game/engine TUs) |
+| `ee-gcc` | 2.9-ee-991111-01 | `sce` matching compiler (Sony runtime) |
+| `wibo` | 1.1.0 | runs the Win32 `ee-gcc-tt` under Linux |
+| `ps2-binutils` | 0.10 | reconstruction + hybrid assembler / linker |
+| `python` | 3.12 | tooling runtime (managed via uv) |
+| `splat` | 0.41.0 | ELF disassembler / splitter |
+| `objdiff` | 3.7.2 | object diffing / match scoring |
+
+<Note>
+  `splat` version 0.41.0 depends on `spimdisasm==1.42.2` and `rabbitizer==1.16.2`. These backend versions determine the generated assembly text, so both are pinned explicitly in `requirements.txt` alongside splat itself. `configure.py` verifies the installed versions match the lock before running any split.
+</Note>
+
+## Installing the toolchain
+
+```bash
+python tools/setup_toolchain.py --download
+python tools/fingerprint_compiler.py --record
+```
+
+`setup_toolchain.py` downloads every component listed in `toolchain.lock.json`, verifies each archive against its locked SHA-256, and installs the files under `compiler/`. It will refuse to install any archive whose hash is not yet recorded — use `--record` to trust and record a hash from a local archive on first use.
+
+After installation, `fingerprint_compiler.py --record` walks every installed file and records its SHA-256 in a per-component manifest. On subsequent runs the same tool verifies the installed files byte-for-byte against that manifest, catching any silent change to the compiler binaries:
+
+```bash
+python tools/fingerprint_compiler.py        # verify one component (ee-gcc)
+python tools/fingerprint_compiler.py --all  # verify every fingerprinted component (CI)
+```
+
+<Warning>
+  Compiler archives are user-supplied and are **never committed** to the repository. The `compiler/` and `tools/download/` directories are gitignored. Do not commit any compiler binary, archive, or extracted file.
+</Warning>
+
+## CI fingerprint verification
+
+The `matching.yml` CI workflow caches the installed toolchain keyed on `toolchain.lock.json`. On each run it re-verifies every fingerprinted component before the byte gates execute:
+
+```bash
+python tools/fingerprint_compiler.py --all
+```
+
+This ensures the cached toolchain has not drifted from the locked state between runs, even when a cache hit restores files from a previous job. The fingerprint check is the first toolchain-touching step in the workflow; a mismatch aborts the run before any compilation or verification happens.
+
+## Why SHA-256 alone is not enough
+
+A SHA-256 on the downloaded archive only proves the archive is the expected file. It does not prove the individual installed binaries — the `cc1.exe`, `as.exe`, and other executables extracted from that archive — are the files you think they are. An archive whose top-level hash matches could in principle contain subtly different binaries than a previous install of the "same" version. The per-file fingerprint manifest closes this gap: `fingerprint_compiler.py` checks `bin/ee-gcc.exe`, `lib/gcc-lib/ee/2.95.2/cc1.exe`, and every other file individually, byte-for-byte, making the installed compiler identity as strong as the archive identity.
+
+<CardGroup cols={2}>
+  <Card title="Docker Setup" icon="docker" href="/setup/docker">
+    Run the toolchain in a container — works on any OS including Windows and macOS.
+  </Card>
+  <Card title="Native Linux Setup" icon="linux" href="/setup/native">
+    Run the toolchain directly on Linux or WSL2 with `CRASHWOC_DIRECT=1`.
+  </Card>
+</CardGroup>

@@ -1,0 +1,108 @@
+---
+title: "promote.py: The Sole Writer of state=matching"
+sidebarTitle: "promote.py"
+description: "promote.py is the only tool that writes state=matching in status manifests. It byte-verifies every claim and rolls back on failure."
+---
+
+`tools/promote.py` is the **only tool that writes `state = matching`** in status manifests. No other script, tool, or hand-edit may set this state. It exists to make the honest path the easy path: every promotion is byte-verified against the retail binary before the manifest is touched, and any failure rolls back every edit exactly, leaving the repository in a clean state.
+
+<Warning>
+  Never hand-edit `state = "matching"` in a manifest. The CI gate (`verify-promoted`) re-derives every `matching` claim byte-for-byte and will catch any unverified promotion, failing the run.
+</Warning>
+
+## What promote.py Does
+
+When you call `promote.py` with one or more function ids, it runs this sequence:
+
+<Steps>
+  <Step title="Resolve all targets">
+    Every function id is resolved against the status manifests before any file is written. A typo or ambiguous name is caught here, so a batch cannot be left half-flipped.
+  </Step>
+
+  <Step title="Flip manifest states">
+    Each matched entry's `state` is updated to `matching` in its manifest file.
+  </Step>
+
+  <Step title="Run the full promotion verifier">
+    `tools/verify_promoted.py` runs in full:
+    - Checks manifest consistency
+    - Re-derives every function's bytes byte-for-byte over its full registry extent
+    - Re-verifies every previously promoted function as well
+    - Links the whole image via `tools/link_image.py`
+    - Checks the retail SHA-256: `c92a59870d47441bbd3f741eca2be42ccbbab28b7d0670d96e09c2f2340fe438`
+  </Step>
+
+  <Step title="Write or roll back">
+    If everything passes, the manifest edits are kept. If **anything** fails, every manifest edit is rolled back exactly and the failure is reported. The repository never holds an unverified promotion.
+  </Step>
+</Steps>
+
+Because step 3 re-derives *every* `matching` claim in the repo, promoting N functions together is exactly as strong a proof as promoting them one by one — and costs one verifier run instead of N. The only trade-off is granularity of failure: a batch rolls back as a whole, so re-run the targets individually, or in halves, to find the one that does not hold.
+
+## Subcommands
+
+```bash
+# Create the initial status manifest for a source file (every function set to asm)
+python tools/promote.py --init src/<group>/<unit>.c
+
+# Promote one or more functions that have reached 100%
+python tools/promote.py src/<group>/<unit>.c
+
+# Promote by full canonical id
+python tools/promote.py pal103:unit-0007:00105a50:NuListGetHead
+
+# Promote several functions in one verifier run
+python tools/promote.py A B C
+
+# Promote from a file of ids
+python tools/promote.py --targets-file ready.txt
+
+# Add the [[data]] table to a unit's manifest (every registry symbol, state asm)
+python tools/promote.py --init-data src/<unit>.c
+
+# Promote a data symbol by its full id
+python tools/promote.py pal103:unit-0014:00613fb0:nuvec4_zero
+
+# Switch a fully matched unit to whole-unit mode
+python tools/promote.py --complete pal103:unit-NNNN
+```
+
+## Integration with decomp.py
+
+The `decomp.py src/...` wrapper calls `promote.py` automatically for any function whose objdiff score reaches 100% while still in state `asm`. This means contributors generally never need to invoke `promote.py` directly during normal matching work — the promotion happens as part of the unit rebuild loop.
+
+To inspect a unit's state without triggering auto-promotion, pass `--no-promote` to `decomp.py`:
+
+```bash
+python decomp.py src/game/creature.c --no-promote
+```
+
+## The `--complete` Flag
+
+`--complete <unit id>` switches a unit's hybrid to whole-unit mode. It:
+
+1. Requires every `[[function]]` to be `matching` and every `[[data]]` entry to be `matching` or `retail`
+2. Lays out the unit's compiler-private data, jump tables, and `.lit4` pool in retail order
+3. Writes the `[[claim]]` table of gap bytes that the layout emits
+4. Promotes any `asm` entries that only the whole-unit layout can place (`.sbss`/`.bss` objects, unsized trailing symbols)
+5. Runs the full verifier — rolls back on failure
+
+On a unit that is already `complete`, re-running `--complete` refreshes the claims.
+
+## Compiler Profiles
+
+`promote.py` selects the correct compiler profile for a unit automatically. Game and engine code compiles under the SN ProDG compiler (profile `default`); Sony runtime units use the Sony compiler (profile `sce`). An explicit `--profile` flag overrides the default.
+
+<Note>
+  `equivalent` is a human review decision and is **never** set by `promote.py`. Only `asm` → `matching` transitions are automated; `equivalent` states must be set by hand after a human judgment call.
+</Note>
+
+## Toolchain Requirement
+
+`promote.py` needs the locked toolchain for the verification step. Run it via `tools/dispatch.py` from the host to route it into the dev container automatically:
+
+```bash
+python tools/dispatch.py python tools/promote.py pal103:unit-0007:00105a50:NuListGetHead
+```
+
+Inside the container the command runs in-process. `decomp.py` handles this routing transparently when it calls `promote.py` on your behalf.

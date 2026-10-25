@@ -1,0 +1,128 @@
+---
+title: "Shared Cross-Client Sessions in Decomp Agent"
+sidebarTitle: "Sessions"
+description: "Sessions are atomic JSON ledgers stored in build/pal103/agent_sessions/. Claude Code can start a session that Codex resumes — and vice versa."
+---
+
+Sessions are the shared experiment ledger that makes the decomp agent genuinely cross-client. Every attempt, hypothesis, hash, mismatch classification, and token cost is recorded in a single atomic JSON file stored in `build/pal103/agent_sessions/` (gitignored). A session is independent of any conversation — Claude Code can open a session, checkpoint several attempts, and hand it off to Codex to continue from the best known state, and vice versa. The MCP never selects a model or reasoning effort; those are always client-side decisions.
+
+## Session Storage
+
+Sessions live in `build/pal103/agent_sessions/` as atomic JSON ledgers. The directory is gitignored, so session state is local to the machine running the server. A single-writer lock (embedded in the ledger and naming the owning client) prevents concurrent writers. Stale locks older than 2 hours are detectable and can be recovered only through the explicit `recover_session_lock` tool — not by retrying `resume_session`.
+
+## Hand-off Pattern
+
+The hand-off between clients is a two-step protocol: the current owner releases the lock cleanly, then the next client takes ownership.
+
+<Steps>
+  <Step title="Current owner calls end_session">
+    The owning client finalizes the session with an outcome string (or leaves the outcome `null` if handing off mid-work) and calls `end_session`. This releases the single-writer lock and marks the last recorded state as the hand-off point.
+  </Step>
+  <Step title="Next client calls resume_session">
+    The receiving client calls `resume_session` with its own `client` identifier. The tool takes the lock for the new owner and returns the full prior context.
+  </Step>
+  <Step title="Continue from where the previous client left off">
+    The resuming client receives the best attempt, all prior hypotheses, seen hashes and diff signatures, encountered mismatch categories, failed experiments, recorded blockers, remaining attempt budget, and the escalation recommendation. It continues the matching loop without re-doing prior experiments.
+  </Step>
+</Steps>
+
+### What `resume_session` Returns
+
+- Best source snapshot and its score
+- All prior hypotheses and their expected effects
+- Seen candidate assembly hashes and diff signatures (for oscillation detection)
+- Mismatch categories encountered so far
+- Failed experiments (to avoid repeating them)
+- Recorded blockers
+- Remaining attempt budget
+- Escalation recommendation (capability-based, never model-named)
+
+### When `resume_session` Refuses
+
+`resume_session` refuses and returns an `unsafe_resume` error when any of the following is true:
+
+- The repo revision or profile fingerprint changed since the session was opened
+- The target's status manifest changed
+- The source file has unrelated edits not attributable to the session
+- A foreign writer currently holds the lock (the lock is fresh, not stale)
+
+Do not use `recover_session_lock` to force past a refused `resume_session` — reconcile the reported conflict first.
+
+## Model and Reasoning Independence
+
+The MCP never chooses or switches models and never sets reasoning effort. Those are always client-side decisions. The server may *return* a capability recommendation in the session response:
+
+```json
+{
+  "recommended": true,
+  "capability": "deep_reasoning",
+  "reason": "remaining mismatch appears register-allocation/scheduling sensitive",
+  "remaining_attempt_budget": 12
+}
+```
+
+The server also *records* optional client-supplied diagnostics (`client`, `model`, `reasoning_effort`) on each checkpoint as opaque metadata. These never affect byte verification, ranking, or promotion.
+
+<Tip>
+Optionally pass `input_tokens` and `output_tokens` on `checkpoint_session`. The ledger accumulates them overall and per client per model. `end_session`, `resume_session`, and the session summary all report a `token_usage` total, so you can see exactly how many tokens a session cost and which client/model spent them. Token counts never affect byte verification, ranking, or promotion.
+</Tip>
+
+## Stop Conditions
+
+<Accordion title="Initial budget and hard maximum">
+  Start with an initial budget of **8** attempts. Extend past 8 only while the best result is still improving. The hard maximum is **20** attempts.
+</Accordion>
+
+<Accordion title="Non-improving attempts">
+  Stop after **4** consecutive non-improving attempts — no measurable progress in fuzzy score or matching bytes across four checkpoints.
+</Accordion>
+
+<Accordion title="Consecutive compile failures">
+  Stop after **3** consecutive compile failures (`compile_ok = false`). Continuing to compile with a broken source wastes budget without producing useful diff data.
+</Accordion>
+
+<Accordion title="Repeated hash or oscillation">
+  Stop when a candidate assembly hash or diff signature repeats with no new hypothesis, or when results oscillate between two previously recorded states. `checkpoint_session` detects these automatically and sets a `stop` flag in its response.
+</Accordion>
+
+<Accordion title="Proven architectural blocker">
+  Stop immediately on a proven architectural blocker — one where the pipeline structurally cannot produce a matching result from C (e.g. `compiler_owned_rodata`, `assembly_origin`). Record the blocker with `record_blocker` before ending. Architectural blockers remove the function from candidate ranking so it is not rediscovered.
+</Accordion>
+
+<Accordion title="Profile fingerprint change">
+  Stop if the compiler or profile fingerprint changes mid-session. This invalidates all prior compile results and means the session was running against an inconsistent toolchain state.
+</Accordion>
+
+<Accordion title="Before ending: restore best checkpoint">
+  Always restore the best safe checkpoint before calling `end_session`, using `restore_best_candidate`. This leaves the source file in the best known state rather than whatever the last failed experiment produced.
+</Accordion>
+
+## Session Outcomes
+
+`end_session` accepts outcome strings case-insensitively. Choose the outcome that most accurately describes why the session ended:
+
+| Outcome | Meaning |
+|---|---|
+| `MATCHING` | Function is byte-exact; proceed to `verify_candidate` and `promote_matching` |
+| `BLOCKED_TOOLING` | A proven pipeline or assembler limit prevents matching from C |
+| `BLOCKED_MISSING_CONTEXT` | Required type layout, prototype, or symbol info is unavailable |
+| `LIKELY_EQUIVALENT_REVIEW_REQUIRED` | Near-match with no structural difference; human review needed |
+| `NO_PROGRESS` | No improvement across the full budget; no architectural blocker |
+| `BUDGET_EXHAUSTED` | Hard maximum of 20 attempts reached without matching |
+| `STALE_SESSION` | Session was abandoned; lock recovered; state unreliable |
+| `SOURCE_CONFLICT` | Source file has unrelated edits; session cannot safely resume |
+
+## CLI Session Commands
+
+The domain CLI exposes the same session operations for scripting:
+
+```bash
+python -m tools.decomp_agent.cli session start pal103:unit-0007:00105a60:NuListGetNext
+python -m tools.decomp_agent.cli session resume <sid> --client codex
+python -m tools.decomp_agent.cli session checkpoint <sid> --hypothesis "try signed short cast" --compile-ok true --exact false
+python -m tools.decomp_agent.cli session end <sid> --outcome MATCHING
+python -m tools.decomp_agent.cli session restore <sid>
+python -m tools.decomp_agent.cli session recover-lock <sid> --client claude-code
+python -m tools.decomp_agent.cli session list
+python -m tools.decomp_agent.cli session get <sid>
+```

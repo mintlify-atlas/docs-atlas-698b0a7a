@@ -1,0 +1,272 @@
+---
+title: "MCP Tool Reference for Decomp Agent"
+sidebarTitle: "MCP Tools"
+description: "Complete reference for the MCP tools exposed by the decomp agent server: health, candidates, context, compile_diff, sessions, verification, and promotion."
+---
+
+The decomp agent MCP server exposes a fixed set of typed, domain-specific tools covering every stage of the matching loop — from repo health checks and candidate selection through compilation, session management, verification, and promotion. All tools are deterministic and model-independent: they read committed registries and drive the locked toolchain; they never select a model, adjust reasoning effort, or edit a manifest directly. The sections below group tools by their role in the workflow.
+
+## Canonical Identifier Format
+
+Every tool that accepts a `target` parameter expects a canonical function or data id of the form:
+
+```text
+pal103:unit-NNNN:vram:name
+```
+
+For example: `pal103:unit-0007:00105a60:NuListGetNext`. A bare name that is duplicated across translation units resolves to **all** candidates — the tools return the ambiguity and never choose. Retry with the canonical id. Unit-level operations accept `pal103:unit-NNNN`.
+
+---
+
+<Accordion title="Project & Candidates">
+
+### `project_health`
+
+Cheap repo diagnostics: validates registries, tool availability, and registry freshness. Returns repair commands for anything out of order. Takes no arguments. This tool never builds.
+
+---
+
+### `list_candidates`
+
+Returns a deterministically ranked list of functions worth attempting, with per-entry reasons. Ranking weights small size, leaf status, C-unit affiliation, and unit momentum. No LLM or embeddings are involved.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `scope` | `string \| null` | Restrict to a unit or library scope |
+| `profile` | `string \| null` | Filter by compiler profile (`default`, `sce`) |
+| `category` | `string \| null` | Filter by mismatch category |
+| `max_size` | `int \| null` | Upper bound on function byte size |
+| `require_c_unit` | `bool` | Only return functions whose unit has a `.c` source file |
+| `prefer_leaf_functions` | `bool` | Boost leaf functions in the ranking |
+| `limit` | `int` | Maximum number of results (default `20`) |
+
+---
+
+### `list_data_candidates`
+
+Returns ranked `[[data]]` entries of fully matching units worth defining in C next (`.rodata` before `.data`, typed, pointer-free, small first), plus units that need `promote.py --init-data` or only `--complete`.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `limit` | `int` | Maximum number of results (default `20`) |
+
+</Accordion>
+
+<Accordion title="Context & Disassembly">
+
+### `resolve_target`
+
+Resolves a canonical function or data id, unit id, name, or address. Returns section and symbol info, or a structured ambiguity report — never a silent choice. Use this to confirm an id before starting a session.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `target` | `string` | Canonical id, bare name, VRAM address, or unit id |
+
+---
+
+### `get_context`
+
+Returns an authoritative dossier for a function or data symbol, split into **facts / ground_truth / classifications / hypotheses / unknowns**. The `ground_truth` block points at (and, for matchable-size functions, inlines) the retail target disassembly — the authoritative source for these bytes. Any cross-platform reference decompilation is a hint only. Missing types and prototypes surface as unknowns, never as guesses.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `target` | `string` | Canonical function or data id |
+| `detail` | `bool` | Include extended evidence and history (default `false`) |
+
+---
+
+### `get_disassembly`
+
+Fetches the full retail disassembly for a single function — the ground truth. Reconstruct C from this authoritative listing and re-diff. This tool **must** be called before recording a blocker or ending a session as `BLOCKED_*`. "It didn't match from the reference" is not a blocker.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `target` | `string` | Canonical function id |
+
+---
+
+### `search_evidence`
+
+Deterministic search across registries, source, headers, history, sessions, and compiler knowledge. Returns ranked evidence records.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `query` | `string` | Free-text search query |
+| `kinds` | `list[EvidenceKind] \| null` | Filter by source kind: `functions`, `units`, `symbols`, `status`, `source`, `headers`, `compiler_knowledge`, `sessions`, `blockers` |
+| `limit` | `int` | Maximum results (default `40`) |
+
+</Accordion>
+
+<Accordion title="Compile & Diff">
+
+### `compile_diff`
+
+Compiles the unit through `tools/cc.py` and byte-compares the output over the **full canonical extent** of the target function. This is the core inner-loop tool.
+
+`exact = true` means byte equality over the whole extent — not a matching prefix. The objdiff percentage alone is **never** proof of matching.
+
+On hosts without the Linux toolchain (e.g. Windows), the call is transparently forwarded into the dev container via `tools/dispatch.py`. Inside the container it runs in-process. Callers do not need to handle this distinction.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `target` | `string` | Canonical function or data id |
+| `session_id` | `string \| null` | Active session to record the result against |
+| `client` | `string \| null` | Opaque client identifier for the session ledger |
+
+**Returns:** a result dict including `exact` (bool), `matching_bytes`, `differing_bytes`, `fuzzy_score`, `diff_signature`, `candidate_asm_hash`, and a `classifications` list of mismatch category records. Pass the `classifications` list directly to `checkpoint_session`.
+
+</Accordion>
+
+<Accordion title="Sessions">
+
+### `start_session`
+
+Creates a shared, resumable experiment session for a target. The session is stored as an atomic JSON ledger in `build/pal103/agent_sessions/` (gitignored), independent of any conversation. Returns a `session_id` for use in subsequent calls.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `target` | `string` | Canonical function or data id |
+| `client` | `string \| null` | Owning client identifier (e.g. `"claude-code"`, `"codex"`) |
+| `model` | `string \| null` | Opaque diagnostic metadata |
+| `reasoning_effort` | `string \| null` | Opaque diagnostic metadata |
+
+---
+
+### `checkpoint_session`
+
+Records one experiment: hypothesis, hashes, diff signature, mismatch classifications, compile result, and optional token counts. Updates attempt counters and detects repeats and oscillation automatically.
+
+Key parameters: `session_id`, `hypothesis`, `expected_effect`, `source_hash`, `candidate_asm_hash`, `diff_signature`, `fuzzy_score`, `matching_bytes`, `differing_bytes`, `classifications` (compile_diff records or bare category name strings), `compile_ok`, `exact`, `input_tokens`, `output_tokens`.
+
+---
+
+### `resume_session`
+
+Returns everything needed to continue a session started by any client: best attempt, all prior hypotheses, seen hashes and diff signatures, mismatch categories, failed experiments, blockers, remaining budget, and the escalation recommendation. Takes ownership of the session lock for the calling client.
+
+`resume_session` **refuses** when: the repo revision or profile fingerprint changed, the target manifest changed, the source has unrelated edits, or a foreign writer holds the lock.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `session_id` | `string` | Session to resume |
+| `client` | `string \| null` | New owning client identifier |
+
+---
+
+### `end_session`
+
+Finalizes the session with an outcome and releases the lock so another client can resume. Outcome strings are matched case-insensitively.
+
+Valid outcomes: `MATCHING`, `BLOCKED_TOOLING`, `BLOCKED_MISSING_CONTEXT`, `LIKELY_EQUIVALENT_REVIEW_REQUIRED`, `NO_PROGRESS`, `BUDGET_EXHAUSTED`, `STALE_SESSION`, `SOURCE_CONFLICT`.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `session_id` | `string` | Session to finalize |
+| `outcome` | `string \| null` | Final outcome string |
+| `client` | `string \| null` | Releasing client identifier |
+| `blocker_status` | `string \| null` | Optional blocker summary |
+
+---
+
+### `restore_best_candidate`
+
+Restores the best attempt's source snapshot to the working tree. Guarded: returns a conflict report and never silently clobbers unrelated edits.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `session_id` | `string` | Session whose best attempt to restore |
+| `force` | `bool` | Override conflict guard (use with caution) |
+| `client` | `string \| null` | Requesting client identifier |
+
+---
+
+### `recover_session_lock`
+
+Breaks a **stale** session lock (older than 2 hours) and takes ownership for the calling client. Refuses to break a fresh lock — use `end_session` on the owning client first.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `session_id` | `string` | Session with the stale lock |
+| `client` | `string \| null` | New owning client identifier |
+
+</Accordion>
+
+<Accordion title="Verification & Promotion">
+
+### `verify_candidate`
+
+Runs an independent full-extent byte check, separate from `compile_diff`. Required before promotion. Toolchain-bound; auto-routes to the dev container when needed.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `target` | `string` | Canonical function or data id |
+| `level` | `"function" \| "unit" \| "image"` | Verification scope (default `"function"`) |
+
+---
+
+### `promote_matching`
+
+Promotes a verified matching function by delegating to `tools/promote.py` — the **sole writer** of `state = matching`. Verifies and rolls back on failure. The MCP never edits a manifest directly and never sets `equivalent` (equivalence is a human review decision).
+
+| Parameter | Type | Description |
+|---|---|---|
+| `target` | `string` | Canonical function or data id |
+
+---
+
+### `compiler_probe`
+
+Compiles a fixed tiny snippet through the locked toolchain profile (no caller-supplied flags). Useful for confirming the toolchain is operational and identifying the active compiler version.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `profile` | `string` | Compiler profile to probe (default `"default"`) |
+
+</Accordion>
+
+<Accordion title="Blockers">
+
+### `record_blocker`
+
+Records a structured blocker for a target with a kind, confidence level, and supporting evidence. Architectural kinds drop a function from candidate ranking. Non-architectural kinds (such as `assembler_normalization`) are temporary and do not remove the function from ranking.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `target` | `string` | Canonical function or data id |
+| `kind` | `BlockerKind` | Structured blocker kind (see below) |
+| `confidence` | `"proven" \| "high" \| "medium" \| "low"` | Confidence level (default `"medium"`) |
+| `evidence` | `list[string] \| null` | Supporting evidence strings |
+| `session_id` | `string \| null` | Associated session |
+| `architectural` | `bool \| null` | Override the kind's default architectural flag |
+| `best_attempt` | `int \| null` | Best fuzzy score reached before blocking |
+| `remaining_mismatch` | `string \| null` | Description of the remaining delta |
+| `recommended_human_action` | `string \| null` | Suggested human follow-up |
+| `recommended_tooling_action` | `string \| null` | Suggested tooling fix |
+
+**Common blocker kinds:** `assembler_normalization` (SN `as` hazard nop not reproduced by the decompals `as` — temporary, fix belongs in gen_hybrid), `architectural` (override any kind to drop from ranking), `bss_common` (uninitialised data outside a complete unit), `data_section_mismatch`, `register_allocation`, `missing_type_layout`, `unknown_prototype`, `assembly_origin`, `compiler_private_partial_unit`, `toolchain_failure`.
+
+<Warning>
+Never record a blocker without first calling `get_disassembly` for the function. A blocker is a *proven* pipeline limit visible in the disassembly or compile output. "It didn't match from the reference" is not a blocker. Jump tables, `.lit4`/`.lit8` constants, and `li.d` GPR pools are all supported — they are not blockers.
+</Warning>
+
+---
+
+### `list_blockers`
+
+Lists all recorded blockers, optionally filtered to a single target.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `target` | `string \| null` | Canonical id to filter by (omit for all) |
+
+</Accordion>
+
+<Accordion title="Toolchain Warmup">
+
+### `warm_toolchain`
+
+Brings the dev container up so later toolchain-bound tools (`compile_diff`, `verify_candidate`, `promote_matching`) run warm. Cheap and idempotent: instant when the container is already running, a few seconds cold. The server warms the container automatically in a background thread at startup; call this explicitly at the start of a session to avoid paying cold-start latency inside a timeout-bounded `compile_diff` call.
+
+Takes no arguments. Returns a status dict with `ok`, `state`, `warmed`, and (on failure) `error`.
+
+</Accordion>

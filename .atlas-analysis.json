@@ -1,0 +1,112 @@
+{
+  "projectType": "general",
+  "projectName": "CrashWOC Decomp PS2",
+  "projectDescription": "A byte-exact matching decompilation of Crash Bandicoot: The Wrath of Cortex for PlayStation 2, reconstructing the retail ELF from hand-written C that compiles to the original bytes.",
+  "theme": "aspen",
+  "primaryColor": "#5c64f4",
+  "lightColor": "#acb4fc",
+  "darkColor": "#ffffff",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Getting Started",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": [
+              "introduction",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Setup",
+            "pages": [
+              "setup/docker",
+              "setup/native",
+              "setup/toolchain"
+            ]
+          },
+          {
+            "group": "Contributing",
+            "pages": [
+              "contributing/workflow",
+              "contributing/validation",
+              "contributing/ci"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Reference",
+        "groups": [
+          {
+            "group": "Pipeline",
+            "pages": [
+              "pipeline/overview",
+              "pipeline/registries",
+              "pipeline/disassembly",
+              "pipeline/matching-c"
+            ]
+          },
+          {
+            "group": "Decomp Agent",
+            "pages": [
+              "decomp-agent/overview",
+              "decomp-agent/mcp-tools",
+              "decomp-agent/sessions",
+              "decomp-agent/data-workflow"
+            ]
+          },
+          {
+            "group": "Tools",
+            "pages": [
+              "tools/decomp-py",
+              "tools/promote",
+              "tools/registry-tools",
+              "tools/type-tools"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Byte-exact matching decompilation targeting PAL retail v1.03 (SLES_503.86)",
+    "Dual-compiler toolchain: SN ProDG EE GCC 2.95.2-EE for game TUs, EE GCC 2.9-ee-991111-01 for Sony runtime",
+    "Full symbol registries extracted from the retail .mdebug ECOFF debug section (3,751 functions, 3,750 data symbols)",
+    "Hybrid object system: splices verified C with retail assembly slices per function state",
+    "MCP server for AI-assisted decompilation (Claude Code, Codex, and any MCP client)",
+    "Canonical byte-verification pipeline: promote.py is the sole writer of state=matching",
+    "objdiff integration with decomp.dev progress reporting",
+    "Fork-safe CI using a private container image that holds game files",
+    "Shared cross-client sessions supporting hand-off between AI agents",
+    "Cooperative decompilation backlog targeting multiplayer/modding use cases"
+  ],
+  "publicApiSurface": [
+    "python decomp.py toolchain",
+    "python decomp.py setup",
+    "python decomp.py src/<group>/<unit>.c",
+    "python tools/promote.py",
+    "python tools/promote.py --init src/<group>/<unit>.c",
+    "python tools/promote.py --init-data src/<unit>.c",
+    "python tools/promote.py --complete <unit-id>",
+    "python tools/status.py --check",
+    "python tools/verify_target.py",
+    "python tools/extract_mdebug.py [--check]",
+    "python tools/extract_data_symbols.py [--check]",
+    "python tools/extract_data_map.py [--check]",
+    "python configure.py [--check|--strict]",
+    "python tools/dispatch.py ninja <target>",
+    "python tools/setup_toolchain.py --download",
+    "python tools/fingerprint_compiler.py [--all]",
+    "python tools/check_types.py [--check]",
+    "python tools/check_codegen.py --build --snapshot|--compare",
+    "python tools/dump_data.py <data-id>",
+    "python -m tools.decomp_agent.cli health",
+    "python -m tools.decomp_agent.cli candidates",
+    "python -m tools.decomp_agent.cli context <id>",
+    "python -m tools.decomp_agent.cli compile-diff <id>",
+    "python -m tools.decomp_agent.cli verify <id>",
+    "python -m tools.decomp_mcp.server --repo <path>"
+  ]
+}

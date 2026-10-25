@@ -1,0 +1,125 @@
+---
+title: "decomp.py: The Contributor Front Door"
+sidebarTitle: "decomp.py"
+description: "decomp.py is the single entry point for contributors: toolchain setup, workspace initialization, and per-unit rebuild with automatic promotion."
+---
+
+`decomp.py` is the only script a contributor needs to run day-to-day. It is a thin, reliable wrapper over the real tools — it never reimplements their logic. The build graph, objdiff report, matching verifier, sanitizer, and CI gates remain the source of truth; `decomp.py` exists purely to string them together into three safe, idempotent commands.
+
+## The Three Commands
+
+| Command | What it does |
+|---|---|
+| `python decomp.py toolchain` | Build the container image, start the dev container, install and verify the locked toolchain |
+| `python decomp.py setup` | Verify `orig/`, split the ELF, build objdiff objects, run verification, generate report |
+| `python decomp.py src/<group>/<unit>.c` | Rebuild one unit, auto-promote 100% functions, print per-function table |
+
+Every command is idempotent and safe to re-run. `setup` only rebuilds what changed.
+
+<Steps>
+  <Step title="Prepare the toolchain">
+    Run once. Ensures the container image is present (pulling `ghcr.io/denzi-gh/crashwoc-decomp` or building locally from the `Containerfile` if the pull fails), starts the dev container, installs the locked cross-toolchain via `tools/setup_toolchain.py`, and verifies every component's fingerprint via `tools/fingerprint_compiler.py --all`.
+
+    ```bash
+    python decomp.py toolchain
+    ```
+
+    When this finishes successfully:
+
+    ```text
+    toolchain ready. Next: python decomp.py setup
+    ```
+  </Step>
+
+  <Step title="Initialize the workspace">
+    Runs the full honest local pipeline once, in this order:
+
+    1. `tools/verify_target.py` — verify `orig/pal103/` against the committed registry
+    2. `configure.py --strict` — disassemble the ELF in strict mode
+    3. `ninja expected current report-current data` — build all object sets
+    4. `ninja verify-promoted` — re-derive every `matching` claim byte-for-byte
+    5. `ninja report` — score the objects and produce the objdiff report
+    6. `tools/check_report_matches.py` — assert every verified-matching function reads 100%
+
+    ```bash
+    python decomp.py setup
+    ```
+
+    When complete, open the repository in the objdiff GUI for live per-function match feedback.
+  </Step>
+
+  <Step title="Work on a unit">
+    Rebuilds a single translation unit through the real objdiff-cli path, auto-promotes any function reaching 100%, and prints the per-function table.
+
+    ```bash
+    python decomp.py src/game/creature.c
+    ```
+  </Step>
+</Steps>
+
+## Per-Unit Output Table
+
+After rebuilding a unit, `decomp.py` merges the objdiff report, the status manifest, and the canonical verify results into a single table:
+
+```text
+Unit: game/creature
+Compiler: default
+
+Function                  Match      State         Verified
+----------------------------------------------------------------
+CreatureInit              100.00%    matching      yes
+CreatureUpdate             96.42%    asm           no
+CreatureDraw               73.18%    asm           no
+
+Unit fuzzy progress:       89.31%
+Verified matching:          1 / 3
+```
+
+The three columns mean distinct things:
+
+- **Match** — the objdiff fuzzy percentage. A guide, not proof.
+- **State** — the committed manifest state: `asm`, `equivalent`, or `matching`.
+- **Verified** — canonical truth: the bytes were re-derived and proven identical to retail.
+
+## Auto-Promotion
+
+Any function that reaches **100%** while still in state `asm` is automatically promoted. The wrapper calls `tools/promote.py`, which byte-verifies the claim and links the full image against the retail SHA-256 before writing `matching`. If verification fails the state rolls back and nothing is committed.
+
+Pass `--no-promote` to inspect a unit without triggering auto-promotion:
+
+```bash
+python decomp.py src/game/creature.c --no-promote
+```
+
+<Note>
+  If a unit has no manifest yet, create one before running `decomp.py` on it:
+
+  ```bash
+  python tools/promote.py --init src/<group>/<unit>.c
+  ```
+</Note>
+
+## Container Routing
+
+Container commands go through `tools/dispatch.py`, so `decomp.py toolchain` and `decomp.py setup` work identically from a Windows host, macOS, or Linux. `dispatch.py` forwards commands transparently into the dev container. Set `CRASHWOC_DIRECT=1` to run toolchain commands natively without a container (Linux / WSL2 only).
+
+The public container image is `ghcr.io/denzi-gh/crashwoc-decomp`. If the pull fails, `decomp.py toolchain` falls back to building the image locally from the `Containerfile`.
+
+## `setup` Pipeline Order
+
+The exact ordered sequence that `setup` executes (from `setup_commands()` in `decomp.py`):
+
+```python
+dispatch_cmd("python", "tools/verify_target.py"),
+dispatch_cmd("python", "configure.py", "--strict"),
+dispatch_cmd("ninja", "expected", "current", "report-current", "data"),
+dispatch_cmd("ninja", "verify-promoted"),
+dispatch_cmd("ninja", "report"),
+dispatch_cmd("python", "tools/check_report_matches.py"),
+```
+
+Each step must succeed before the next runs. If any step fails, `decomp.py` prints the failed command and exits non-zero.
+
+<Note>
+  Game files are never committed to this repository. `decomp.py` checks for them at `orig/pal103/` before running any pipeline step that needs them. See the README for the exact build, file sizes, and hashes required.
+</Note>

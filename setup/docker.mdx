@@ -1,0 +1,94 @@
+---
+title: "Docker Setup for CrashWOC Decomp PS2"
+sidebarTitle: "Docker"
+description: "Set up the CrashWOC Decomp PS2 decompilation environment using Docker or Podman. Works on any OS including Windows and macOS."
+---
+
+The CrashWOC Decomp PS2 matching toolchain consists of Linux-only EE GCC binaries that cannot run directly on Windows or macOS. Docker (or Podman) solves this by running those binaries inside a pre-built container image, while your editor and Python scripts stay on the host. Three idempotent commands take you from a fresh clone to a working objdiff session, and `tools/dispatch.py` transparently routes every toolchain invocation into the running container so you never need to manage it manually.
+
+<Note>
+  If you are on macOS or plain Windows (no WSL2), Docker is your **only** option — the EE GCC binaries are Linux ELFs and cannot execute outside a Linux environment. WSL2 users may prefer the [Native Linux setup](/setup/native) instead.
+</Note>
+
+## Prerequisites
+
+- **Python 3.12 or newer** on your host machine
+- **Docker** or **Podman** installed and the daemon running
+- A **legal personal copy** of *Crash Bandicoot: The Wrath of Cortex* (PAL build `SLES_503.86`)
+
+## Setup
+
+<Steps>
+  <Step title="Clone the repository">
+    Clone the project and enter the directory:
+
+    ```bash
+    git clone https://github.com/denzi-gh/crashwoc-decomp-ps2.git
+    cd crashwoc-decomp-ps2
+    ```
+  </Step>
+
+  <Step title="Place game files">
+    Copy your own game files into `orig/pal103/`. The pipeline expects exactly two files at these paths:
+
+    ```text
+    orig/pal103/SLES_503.86
+    orig/pal103/SYSTEM.CNF
+    ```
+
+    `python tools/verify_target.py` checks the file sizes, SHA-1, SHA-256, the parsed `SYSTEM.CNF` values, and every field of the ELF header against the committed registry — every line must read `PASS`. Game files are never committed.
+  </Step>
+
+  <Step title="Pull the container and install the locked toolchain">
+    ```bash
+    python decomp.py toolchain
+    ```
+
+    This command pulls the public base image `ghcr.io/denzi-gh/crashwoc-decomp`, starts a persistent dev container named `crashwoc-dev-<hash>`, and installs and verifies the locked toolchain inside it. The base image is pinned by immutable digest to `python:3.12-slim-trixie` and `uv:0.11.27`, so the build environment is byte-reproducible across machines.
+
+    From this point on, `tools/dispatch.py` intercepts every toolchain command and forwards it transparently into the running container. You will not need to `docker exec` or `docker run` anything manually.
+  </Step>
+
+  <Step title="Run the full setup pipeline">
+    ```bash
+    python decomp.py setup
+    ```
+
+    This runs the complete pipeline inside the container: it verifies `orig/`, splits the target ELF with splat, compiles hybrid objects, runs byte verification, and generates the progress report. Only files that changed since the last run are rebuilt, so re-running is always safe.
+  </Step>
+
+  <Step title="Open the objdiff GUI">
+    With the build complete, open the repository root in the **objdiff GUI**. objdiff reads `objdiff.json` (generated during setup) and shows live per-function match percentages and assembly diffs for all 247 translation units. You can now start working on a unit:
+
+    ```bash
+    python decomp.py src/game/creature.c
+    ```
+
+    This rebuilds a single unit, refreshes the report, and prints a per-function match table to your terminal.
+  </Step>
+</Steps>
+
+## Command reference
+
+All three primary commands are idempotent and safe to re-run at any time:
+
+| Command | What it does |
+|---|---|
+| `python decomp.py toolchain` | Pulls the image, starts the dev container, installs and verifies the locked toolchain |
+| `python decomp.py setup` | Runs the full pipeline inside the container; incremental on re-runs |
+| `python decomp.py <unit>.c` | Rebuilds one translation unit and prints its per-function match table |
+
+## Container image details
+
+The public image `ghcr.io/denzi-gh/crashwoc-decomp` is built from the repository's `Containerfile` and contains only the build environment — no game bytes and no matching toolchain. Both are supplied at runtime, so the package is safe to keep public.
+
+The `Containerfile` pins every upstream source by immutable digest:
+
+- **Base image**: `python:3.12-slim-trixie@sha256:423ed6ab…199fbf`
+- **uv**: `ghcr.io/astral-sh/uv:0.11.27@sha256:4d01caf3…693419`
+
+The image also includes Debian Trixie's i386 multilib packages (`libc6:i386`, `libstdc++6:i386`, `zlib1g:i386`) required to run the 32-bit EE GCC 2.9 compiler binaries, and bakes in the pinned splat, spimdisasm, and rabbitizer packages from `requirements.txt` so `configure.py` never needs a network fetch at run time.
+
+<Tip>
+  Podman works identically to Docker throughout — every `docker` command in the project can be replaced with `podman` without any other changes.
+</Tip>

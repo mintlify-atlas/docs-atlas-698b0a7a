@@ -1,0 +1,110 @@
+---
+title: "CI Pipeline: Fork-Safe Private Build Image"
+sidebarTitle: "CI"
+description: "How the two CI workflows work: validate.yml for structure checks and matching.yml using a private container image that holds the retail game files."
+---
+
+The CI setup for this project has one hard constraint: the retail game files must never appear in a public repository or in any artifact that leaves a runner, while still enabling full byte-gated verification on every push. This page explains how the two workflows achieve that, why `matching.yml` deliberately omits a `pull_request` trigger, and what the three-piece private image arrangement looks like end to end.
+
+## The two workflows
+
+<CardGroup cols={2}>
+  <Card title="validate.yml" icon="check-circle">
+    **Triggers:** every push and every pull request (including forks).
+
+    Pure structure checks: status manifests, symbol registries, unit tests, and a guard that nothing game-derived is tracked in the public repository. Needs no game files and no toolchain — runs in minutes on any GitHub-hosted runner.
+  </Card>
+  <Card title="matching.yml" icon="lock">
+    **Triggers:** pushes to any branch in *this* repository, nightly schedule, and manual `workflow_dispatch`.
+
+    The full byte-gated pipeline. Runs *inside* a private container image that has the retail game files baked in. **Never triggered on `pull_request`** — see the fork-safety section below.
+  </Card>
+</CardGroup>
+
+## Why there is no `pull_request` trigger on matching.yml
+
+A `pull_request` event executes the workflow file **from the PR branch** inside whatever container the job specifies. If `matching.yml` had a `pull_request` trigger, a fork contributor could rewrite the workflow in their PR to exfiltrate the retail game bytes from the private `/orig` image — and GitHub Actions would faithfully run that rewritten file.
+
+Removing the trigger closes that hole entirely. `pull_request_target` is also **not** used, because it runs the same untrusted PR code with the same elevated access.
+
+Instead, the byte gates are driven by the **`push` trigger on any branch** (`branches: ["**"]`). This is fork-safe by construction: a push to a fork runs in the *fork's* own Actions environment, never in this repository, so untrusted code can never reach the private image through it. Only someone with write access to this repository can push a branch here, and their code is treated as trusted.
+
+## The three-piece setup
+
+The arrangement follows [dtk-template's private-build-image method](https://github.com/encounter/dtk-template/blob/main/docs/github_actions.md):
+
+```text
+this repo (public, zero game bytes)
+  Containerfile ──publish-image.yml──► ghcr.io/denzi-gh/crashwoc-decomp      [public package]
+                                              ▲ FROM
+crashwoc-decomp-ps2-build (PRIVATE repo)      │
+  orig/pal103/{SLES_503.86,SYSTEM.CNF}        │
+  Dockerfile (COPY orig /orig) ── its build.yml ──► ghcr.io/denzi-gh/crashwoc-decomp-ps2-build:main  [PRIVATE package]
+                                                          ▲ matching.yml job container
+
+matching.yml: cp -a /orig . → cached toolchain install + fingerprints → verify_target
+  → registry --checks → configure → ninja gates → report → check_report_matches
+  → sanitize → stage → smoke_report → upload artifact
+```
+
+<Steps>
+  <Step title="Public base image">
+    **`ghcr.io/denzi-gh/crashwoc-decomp`** — built from the `Containerfile` in this repository by `publish-image.yml` whenever the `Containerfile` or `requirements.txt` change.
+
+    Contains only the build environment: Debian trixie, Python 3.12, pinned splat and backends, ninja, i386 runtime libraries for the 32-bit compiler. **No game bytes. No matching toolchain.** The package is safe to keep public.
+  </Step>
+  <Step title="Private build repo">
+    **`denzi-gh/crashwoc-decomp-ps2-build`** — a separate, private repository. It holds `orig/pal103/` (the retail ELF and `SYSTEM.CNF`) and a two-line Dockerfile:
+
+    ```dockerfile
+    FROM ghcr.io/denzi-gh/crashwoc-decomp
+    COPY orig /orig
+    ```
+
+    Its own workflow builds this image and pushes it to GHCR as a **private** package. To update game files or pick up a new base image, push there or re-run its workflow.
+  </Step>
+  <Step title="matching.yml">
+    Runs inside the private image on `ubuntu-latest`. Pull authorization is the package's Actions-access grant plus the standard `GITHUB_TOKEN` — no PAT, no secret URL required.
+
+    The job copies `/orig` into the workspace, installs and fingerprints the locked toolchain, runs all registry `--check` gates, disassembles, builds the full ninja graph, re-verifies every `matching` claim, and stages the sanitized report for upload.
+  </Step>
+</Steps>
+
+## PR verification model
+
+<Accordion title="Collaborator branch (same-repo PR)">
+  When a contributor with write access opens a PR from a branch in this repository, every push to that branch runs the full `matching.yml` pipeline automatically. The job uploads `SLES_503.86_report` as a workflow artifact, and the decomp.dev app attaches that artifact to the open PR as a progress-vs-main comment. No manual dispatch is needed.
+</Accordion>
+
+<Accordion title="Fork PR">
+  A PR from a fork triggers only `validate.yml` — the public, no-game-files structure checks (manifests, registries, unit tests, the "nothing game-derived is tracked" guard). That is the full contract a fork PR can rely on.
+
+  To byte-verify a fork PR, a maintainer:
+  1. Reviews the diff carefully, paying particular attention to `.github/`, `tools/`, and `toolchain.lock.json`.
+  2. Cherry-picks or merges the vetted commit onto an **in-repo branch**.
+  3. Lets that branch's push trigger run `matching.yml` with the full byte gates.
+</Accordion>
+
+## Caching and speed
+
+Two `actions/cache` entries keep warm runs fast:
+
+| Cache entry | Cache key |
+|---|---|
+| Locked toolchain (`tools/download/` + `compiler/`) | `toolchain.lock.json` content hash |
+| Ninja build tree (`build/`, `expected/`, `.ninja_*`) | Per-commit SHA with a prefix restore key |
+
+A cold run — image pull plus toolchain download — takes roughly 5–10 minutes. Warm runs are incremental: ninja rebuilds only what changed since the cached commit.
+
+## What leaves a run
+
+Only one artifact ever leaves a `matching.yml` run: **`SLES_503.86_report`**, the whitelist-sanitized report produced by `tools/sanitize_report.py`. This is the file [decomp.dev](https://decomp.dev) consumes. Everything else — `orig/` copies, object files, linked images — dies with the ephemeral runner. The pipeline never writes back to the repository.
+
+Before the artifact uploads, two gates run against it in sequence:
+
+1. **`tools/check_report_matches.py`** (right after `ninja report`) — asserts that every function `verify_promoted.py` proved byte-matching reads exactly 100% in the report.
+2. **`tools/smoke_report.py`** (after staging to `build/publish/report.json`) — re-checks the exact bytes that will leave the runner: valid JSON, a strict subset of the objdiff Report schema (no stray fields), no `orig/` reference, no absolute path, no embedded byte blob, no hollow "100% of nothing" measure, and again every verified matching function at 100%.
+
+<Note>
+  A stale or tampered staged file fails `smoke_report.py` before upload. The file on disk when `smoke_report.py` runs must be identical to what `sanitize_report.py` just wrote — any intermediate modification is caught.
+</Note>

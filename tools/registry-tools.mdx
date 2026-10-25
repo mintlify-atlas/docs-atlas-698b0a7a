@@ -1,0 +1,147 @@
+---
+title: "Registry Extraction and Verification Tools"
+sidebarTitle: "Registry Tools"
+description: "Tools for extracting, verifying, and checking the symbol registries and data map derived from the retail ELF's .mdebug and .symtab sections."
+---
+
+All registries in this project are pure, deterministic functions of the retail ELF. They are never hand-edited: each extraction tool reads the binary in native table order and writes committed files that later tooling — splat, the TU split, objdiff, the verifier — builds on. Every tool that produces a registry also has a `--check` mode that verifies the committed file exactly matches a fresh extraction, providing a byte-level guarantee that the registry has not drifted from the binary.
+
+<Note>
+  All registry checks (`--check` flags below) need the game files at `orig/pal103/`. They run without a toolchain and are part of the `validate.yml` CI gate on every push.
+</Note>
+
+## Symbol Registries
+
+<Accordion title="tools/extract_mdebug.py — ECOFF .mdebug section">
+  The retail `SLES_503.86` executable ships a complete MIPS ECOFF debug section (`.mdebug`, magic `0x7009`). It describes every translation unit and procedure in the program — their addresses, stack frames, and saved-register masks. `extract_mdebug.py` reads it straight out of the binary in native table order and emits three deterministic registries:
+
+  | File | Entries | Contents |
+  |---|---|---|
+  | `config/pal103/units.toml` | 267 | translation units (file descriptors) |
+  | `config/pal103/functions.toml` | 3,751 | procedures (address, frame, register masks) |
+  | `config/pal103/symbol_addrs.txt` | 6,318 | splat-style `name = address` list |
+
+  Nothing here is heuristic: every address is read or computed from the tables (`fdr.adr + pdr.adr`), never guessed.
+
+  ```bash
+  python tools/extract_mdebug.py           # regenerate the registries
+  python tools/extract_mdebug.py --check   # verify committed == fresh extraction
+  python tools/extract_mdebug.py --version pal103
+  ```
+
+  Global data addresses in `symbol_addrs.txt` are cross-checked against the allocated section ranges in `config/pal103/sections.json`, so an ECOFF `value` that is a size rather than an address can never be emitted as one.
+</Accordion>
+
+<Accordion title="tools/extract_data_symbols.py — .symtab and STABS data symbols">
+  Reads `.symtab` and STABS debug info to build the full data registry: every named data global the external table defines and every file-local static of a unit's local symbol run.
+
+  | File | Entries | Contents |
+  |---|---|---|
+  | `config/pal103/data_symbols.toml` | 3,750 | one `[[symbol]]` per named data symbol (2,549 globals, 1,201 statics) |
+
+  ```bash
+  python tools/extract_data_symbols.py           # regenerate
+  python tools/extract_data_symbols.py --check   # verify committed == fresh extraction
+  python tools/extract_data_symbols.py --stats   # census (sizes, STABS types, name clashes)
+  ```
+
+  Per symbol the registry records: `key`, `name`, `unit`, `scope`, `stem`, `address`, `section`, `storage`, `size`, `size_evidence`, `extent`, `pad_zero`, and (for the 130 `sce` units with STABS) `type` and `stab`. TOML has no null: an absent key means unknown, and nothing is guessed.
+</Accordion>
+
+<Accordion title="tools/extract_data_map.py — per-unit data ranges">
+  Tiles `.data`, `.rodata`, `.lit4`, `.sdata`, `.sbss`, `.bss`, and the 0x80-byte orphan run into per-unit owned ranges. A range is owned by one unit or marked `unassigned`.
+
+  | File | Entries | Contents |
+  |---|---|---|
+  | `config/pal103/data_map.toml` | 679 | exact tiling of the data sections into per-unit ranges |
+
+  ```bash
+  python tools/extract_data_map.py --check   # verify committed == fresh extraction
+  ```
+
+  Evidence kinds:
+
+  | `evidence` | Meaning |
+  |---|---|
+  | `mdebug` | the unit's named symbols prove it |
+  | `xref` | only the unit's code references it (`.rodata` strings / jump tables / pools, `.lit4` pools) |
+  | `gap` | nothing attributes the bytes |
+  | `orphan` | the un-sectioned run at `0x00293680` |
+
+  Result: `0x4182AB` of `0x47315C` data bytes owned; `.lit4` is fully tiled by the 57 per-unit assembler pools.
+</Accordion>
+
+## Target Verification
+
+<Accordion title="tools/verify_target.py — verify orig/ against the registry">
+  Checks `orig/pal103/` against the committed registry. Every field is checked explicitly — nothing is assumed.
+
+  ```bash
+  python tools/verify_target.py
+  ```
+
+  Checks performed (every line must read `PASS`):
+
+  - File sizes
+  - SHA-1 and SHA-256 hashes
+  - Parsed `SYSTEM.CNF` values
+  - All ELF header fields
+  - Program headers
+  - Section header table
+
+  This is the first step in both `decomp.py setup` and the `matching.yml` CI pipeline.
+</Accordion>
+
+## Disassembly
+
+<Accordion title="configure.py — splat-driven ELF disassembly">
+  Runs [splat](https://github.com/ethteck/splat) to disassemble the retail ELF into per-section assembly and a linker script. The whole loaded image is a single `PT_LOAD` segment, so one splat code segment covers every loaded section.
+
+  ```bash
+  python configure.py            # disassemble into asm/ and build/
+  python configure.py --check    # split twice, prove identical output
+  python configure.py --strict   # strict mode used by CI
+  ```
+
+  `configure.py` first verifies the installed disassembler matches the locked versions (`splat`, `spimdisasm`, `rabbitizer`), then runs `splat split`. Nothing splat produces is committed — all output lands in gitignored `asm/` and `build/` directories. `--check` regenerates the whole split twice and verifies every file is byte-for-byte identical, proving the disassembly is reproducible from the binary alone.
+
+  Splat consumes `config/pal103/symbol_addrs.txt` from the previous step for function and data names. Pinned versions live in `requirements.txt`.
+</Accordion>
+
+## Manifest Validation
+
+<Accordion title="tools/status.py --check — validate status manifests">
+  Validates all status manifests are well-formed and structurally consistent with the mdebug registries. Needs no game files and no toolchain — runs anywhere and is part of `validate.yml`.
+
+  ```bash
+  python tools/status.py --check
+  ```
+
+  Checks every manifest in `config/pal103/status/`:
+
+  - Parses correctly, uses schema 1, and declares a known compiler profile
+  - Path, `source` file, and mdebug unit all name the same translation unit
+  - Every function id (`version:unit-NNNN:vram:name`) exists in `functions.toml` with the correct unit, address, and name
+  - The manifest lists the unit's full function set — no missing entries, no duplicates, no strays
+  - Each function has a valid state: `asm`, `equivalent`, or `matching`
+  - Optional `[[data]]` and `[[claim]]` tables are well-formed
+  - Every `src/**/*.c` has a manifest, so no source file escapes accounting
+
+  A `matching` state here is a *claim*; `verify_promoted.py` re-derives the bytes before it is trusted. `status.py --check` only guarantees the claim is structurally consistent.
+</Accordion>
+
+## Running All Registry Checks
+
+The full set of pure-Python registry gates (no toolchain, no game files needed for `status.py`):
+
+```bash
+python -m unittest discover -s tests -v       # unit tests
+python tools/status.py --check                # manifests are well-formed
+python tools/verify_target.py                 # orig/ matches the committed registry
+python tools/extract_mdebug.py --check        # registries == fresh extraction
+python tools/extract_data_symbols.py --check  # data registry == fresh extraction
+python tools/extract_data_map.py --check      # data map == fresh extraction
+python configure.py --check                   # disassembly is deterministic
+```
+
+Run these before opening a pull request. CI (`validate.yml`) runs the same set on every push and PR.

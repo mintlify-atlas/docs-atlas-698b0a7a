@@ -1,0 +1,124 @@
+---
+title: "Reconstruction Pipeline: End-to-End Overview"
+sidebarTitle: "Overview"
+description: "How CrashWOC Decomp PS2 reconstructs the retail ELF: target verification, symbol registries, disassembly, baseline linking, and byte-gated matching C."
+---
+
+The CrashWOC Decomp PS2 reconstruction pipeline is a strictly ordered sequence of byte-gated stages. Each stage builds on a proven foundation: later stages are only attempted once all earlier gates pass. Every generated artifact is game-derived and therefore gitignored — only the committed tooling and address registries live in the repository; the bytes themselves must be supplied by the user from a legally obtained copy of the game.
+
+## Target ELF Properties
+
+The single target build is **Crash Bandicoot: The Wrath of Cortex — PAL retail v1.03, SLES-50386 (`SLES_503.86`)**. Key header fields extracted directly from the retail executable:
+
+```text
+entry:     0x00100008
+_gp:       0x00634970
+ELF flags: 0x20924001  (noreorder, 5900, eabi64, mips3)
+```
+
+The entire program lives inside a single `PT_LOAD` segment (file offset `0x1000` → vram `0x00100000`). The loaded sections are:
+
+| Section   | Address      | Section   | Address      |
+|-----------|--------------|-----------|--------------|
+| `.text`   | `0x00100000` | `.lit4`   | `0x0062C980` |
+| `.vutext` | `0x00281530` | `.sdata`  | `0x0062E980` |
+| `.data`   | `0x00293700` | `.sbss`   | `0x00633000` |
+| `.rodata` | `0x00613480` | `.bss`    | `0x00633400` |
+
+## Pipeline Stages
+
+<Steps>
+
+### Target Verification
+
+Confirm that the retail files you supplied are byte-for-byte identical to the one build the project targets.
+
+```bash
+python tools/verify_target.py
+```
+
+Checks file sizes, SHA-1 and SHA-256 hashes, parsed `SYSTEM.CNF` values, and every field of the ELF header, program headers, and section header table against the committed registry. Every line must read `PASS`.
+
+### Symbol Registries
+
+Extract MIPS ECOFF debug information from the retail `.mdebug` section into three deterministic registry files: 267 translation units, 3,751 functions, and 6,318 symbols.
+
+```bash
+python tools/extract_mdebug.py           # (re)generate the registries
+python tools/extract_mdebug.py --check   # verify committed == fresh extraction
+```
+
+### Data Registries
+
+Extract named data symbols and section tiling from `.symtab` and STABS into two further registries: `data_symbols.toml` (3,750 symbols) and `data_map.toml` (679 ranges).
+
+```bash
+python tools/extract_data_symbols.py           # (re)generate
+python tools/extract_data_symbols.py --check   # verify committed == fresh extraction
+python tools/extract_data_map.py --check       # verify data map
+```
+
+### Disassembly
+
+Run splat to split the retail ELF into per-section assembly files and a generated linker script. All outputs land in gitignored `asm/` and `build/` directories.
+
+```bash
+python -m pip install -r requirements.txt   # pinned splat + backends
+python configure.py                          # disassemble into asm/ and build/
+python configure.py --check                  # split twice; prove identical output
+```
+
+### Binary Baseline
+
+Prove that the loaded image is reconstructible from per-section `.incbin` objects placed at the exact addresses recorded in `linker.ld`. No toolchain is required for the default run.
+
+```bash
+python tools/build_baseline.py          # reconstruct + verify (no toolchain)
+python tools/build_baseline.py --link    # also link with real PS2 ee-ld
+```
+
+Both the **loaded layout** (every object address matches the target section table) and the **packaged hash** (SHA-256 `c92a59870d47441bbd3f741eca2be42ccbbab28b7d0670d96e09c2f2340fe438`) must match exactly.
+
+### Monolithic Assembly Baseline
+
+Replace the `.text` blob with real assembled instructions by assembling splat's whole-program `asm/text.s` and proving the result is byte-identical to the retail `.text`.
+
+```bash
+python tools/assemble_text.py    # assemble asm/text.s, link, compare .text
+```
+
+The assembled `.text` SHA-256 is `25e07defbc3617ff1502295a050c8fea1ee0c5a6d0e52838e82d6b7b3abf63e5`. Four static functions duplicated across translation units are disambiguated by renaming them to `NAME__<vram>` — no instruction byte moves.
+
+### Translation-Unit Split
+
+Split the monolithic `.text` into 247 per-TU assembly objects following the boundaries recorded in `.mdebug`, and prove the whole loaded image still links to the same packaged SHA-256.
+
+```bash
+python tools/split_text.py
+```
+
+### Matching C
+
+Replace each per-TU assembly object with hand-written C that compiles to exact retail bytes. Status manifests at `config/pal103/status/` track every function as `asm`, `equivalent`, or `matching`. Only `tools/promote.py` may promote a function to `matching` after byte verification.
+
+</Steps>
+
+## Completion Levels
+
+Progress is tracked against three distinct goals, each a strict superset of the previous:
+
+<CardGroup cols={3}>
+  <Card title="Loaded-Image Exact" icon="layer-group">
+    Every runtime-relevant byte and address matches: all allocated sections, entry point `0x00100008`, and `_gp` `0x00634970`. This is the primary technical goal.
+  </Card>
+  <Card title="Packaged ELF Exact" icon="file-check">
+    The generated `SLES_503.86` has the exact retail SHA-256: `c92a59870d47441bbd3f741eca2be42ccbbab28b7d0670d96e09c2f2340fe438`.
+  </Card>
+  <Card title="Pure Relink Exact" icon="archive">
+    Every ELF byte — including `.mdebug`, `.stab`, `.symtab`, and all linker metadata — is regenerated from source. The final archival goal.
+  </Card>
+</CardGroup>
+
+<Note>
+  Nothing game-derived is ever committed to this repository. All generated artifacts — extracted `.bin` blobs, assembled objects, linked ELFs, and registry outputs — land in gitignored directories (`build/`, `asm/`, `expected/`). Only tools, address registries, and committed C source live in the tree.
+</Note>

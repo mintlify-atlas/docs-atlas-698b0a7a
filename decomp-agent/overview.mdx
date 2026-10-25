@@ -1,0 +1,115 @@
+---
+title: "Decomp Agent: AI-Assisted Matching Decompilation"
+sidebarTitle: "Overview"
+description: "The decomp agent provides deterministic, model-independent tools for AI-assisted decompilation. Works with Claude Code, Codex, and any MCP client."
+---
+
+The decomp agent is the shared, cross-client infrastructure for byte-exact matching decompilation of *Crash Bandicoot: The Wrath of Cortex* (PS2). It targets a single build — PAL retail v1.03 (`SLES_503.86`) — and exposes every matching operation through deterministic, LLM-independent tools that work identically under Claude Code, OpenAI Codex, or any standards-compliant MCP client. Client-specific launch and escalation notes live in `CLAUDE.md` (Claude Code) and `AGENTS.md` (Codex); all shared policy lives in `docs/decomp_agent.md`, and that file wins on policy conflicts.
+
+## Two Layers
+
+The system is split into a domain layer and a thin server layer, keeping all business logic provider-agnostic.
+
+**`tools/decomp_agent/`** is the deterministic, model-independent domain layer. It works without MCP and without any LLM: it reads the committed registries, ranks candidates, builds context, drives the existing locked toolchain for compile/diff/verify, records shared sessions and blockers, and delegates promotion to `tools/promote.py`. Every operation is rooted through an explicit `DecompProject(root)` and returns JSON-compatible dicts.
+
+**`tools/decomp_mcp/server.py`** is a thin FastMCP stdio server that validates inputs and calls the domain layer. It contains **no** provider- or model-selection logic.
+
+The domain CLI (`python -m tools.decomp_agent.cli`) exposes the same operations for scripting and is also how toolchain-bound work is re-invoked inside the container.
+
+## Source-of-Truth Hierarchy
+
+When facts conflict, the following order resolves them. Lower-ranked sources never override higher-ranked ones — a source comment never overrides `profiles.toml`, `status/`, `functions.toml`, or `units.toml`.
+
+1. Committed registries + status manifests (`config/pal103/…`)
+2. The retail target disassembly (`get_disassembly` / the `target-asm` resource / `asm/text.s`) — the ground truth for a function's own bytes
+3. Fresh compiler / assembler / linker / byte-verification output
+4. Current hand-written C and committed headers
+5. Maintained docs (including `docs/decomp_agent.md`)
+6. Comments, unverified hypotheses, and any cross-platform reference decompilation (e.g. a GameCube/PC port)
+
+<Warning>
+A reference decompilation of the same game on another platform is rank 6 — a hint for names, call order, and rough structure only. A different compiler and a different CPU produce different codegen: branch directions, dispatch constants, immediate materialization, struct offsets, and even control-flow shape all differ. Reconstruct C from the target disassembly and verify every branch/constant/offset against it; **never transcribe a port's control flow.** `get_context` returns a `ground_truth` block on every call (and inlines the listing for matchable-size functions) precisely so this step cannot be skipped.
+</Warning>
+
+## Running the MCP Server
+
+Start the server by pointing it at the repository root. Root resolution order is: `--repo` flag → `CRASHWOC_PROJECT_DIR` environment variable → current working directory.
+
+```bash
+python -m tools.decomp_mcp.server --repo /path/to/crashwoc-decomp-ps2
+```
+
+The directory must validate as a compatible project or the server refuses to start. All logging goes to stderr; stdout carries only MCP messages.
+
+This repo ships a `.mcp.json` with the server pre-configured as `crashwoc-decomp` (stdio transport, `--repo .`). Install the SDK once:
+
+```bash
+python -m pip install -r requirements-mcp.txt
+```
+
+The domain layer and its CLI need no extra packages.
+
+## The Domain CLI
+
+Every operation the MCP server exposes is also reachable through the CLI, enabling scripting, testing, and container re-invocation without an MCP client.
+
+```bash
+python -m tools.decomp_agent.cli health
+python -m tools.decomp_agent.cli candidates --limit 10 --max-size 128
+python -m tools.decomp_agent.cli context pal103:unit-0007:00105a60:NuListGetNext
+python -m tools.decomp_agent.cli compile-diff pal103:unit-0007:00105a60:NuListGetNext --session <sid>
+python -m tools.decomp_agent.cli verify pal103:unit-0007:00105a60:NuListGetNext --level function
+```
+
+All subcommands accept `--repo`, `--version`, and `--json` either before or after the subcommand name.
+
+## The Matching Loop
+
+The full matching workflow follows a fixed sequence of tool calls. Write C using your client's normal editor; the MCP never edits source files (except the guarded best-candidate restore).
+
+<Steps>
+  <Step title="project_health">
+    Check whether the repo is ready. This tool never builds; it returns repair commands if anything is out of order.
+  </Step>
+  <Step title="list_candidates">
+    Retrieve deterministically ranked targets. Ranking is based on small size, leaf status, C-unit affiliation, and unit momentum. No LLM, no embeddings — every ranking carries its reasons.
+  </Step>
+  <Step title="resolve_target / get_context">
+    Fetch the authoritative dossier for the target, split into **facts / ground_truth / classifications / hypotheses / unknowns**. The `ground_truth` block points at (and, when small, inlines) the target disassembly. Read it before writing any C. Missing types and prototypes are reported as unknowns, never guessed.
+  </Step>
+  <Step title="start_session">
+    Open a shared, resumable experiment session for the target. Sessions are stored as atomic JSON ledgers in `build/pal103/agent_sessions/` and are independent of any conversation.
+  </Step>
+  <Step title="Write C">
+    Write or edit the source in `src/&lt;unit&gt;.c` using your client's normal editing tools. The MCP does not edit files directly.
+  </Step>
+  <Step title="compile_diff">
+    Compile the unit through `tools/cc.py` and byte-compare over the **full canonical extent**. `exact = true` means byte equality over the whole extent, not a matching prefix. The objdiff percentage alone is never proof of matching.
+  </Step>
+  <Step title="checkpoint_session">
+    Record every experiment: hypothesis, hashes, diff signature, classifications. Pass `compile_diff`'s classification records as returned, or bare category names such as `"register_allocation"`. Repeat detection and oscillation tracking are automatic.
+  </Step>
+  <Step title="Iterate">
+    Repeat steps 5–7 until a stop condition fires. See the [Sessions page](/decomp-agent/sessions) for the full stop-condition policy.
+  </Step>
+  <Step title="verify_candidate --level function">
+    Run an independent full-extent byte check. This is separate from `compile_diff` and is required before promotion.
+  </Step>
+  <Step title="promote_matching">
+    Delegate to `tools/promote.py` — the sole writer of `state = matching`. It verifies and rolls back on failure. The MCP never edits a manifest directly and never sets `equivalent` (equivalence is a human review decision).
+  </Step>
+</Steps>
+
+## Canonical Identifiers
+
+Always prefer the full canonical function id:
+
+```text
+pal103:unit-0007:00105a60:NuListGetNext
+```
+
+A bare name that is duplicated across translation units resolves to **all** candidates — the tools return the ambiguity and never choose. Retry with the canonical id.
+
+## Security Boundary
+
+The MCP exposes only typed, domain-specific tools. There is **no** `run_command`, `read_file`, `write_file`, `set_compiler_flags`, or `edit_manifest`. Compilation always goes through `tools/cc.py`; promotion always through `tools/promote.py`. No arbitrary path, flag, or shell interface exists, and no existing byte gate is weakened.

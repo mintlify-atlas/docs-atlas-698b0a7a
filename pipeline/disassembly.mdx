@@ -1,0 +1,87 @@
+---
+title: "ELF Disassembly and Baseline Reconstruction"
+sidebarTitle: "Disassembly"
+description: "How splat splits the retail ELF into per-section assembly, and how the binary and text baselines prove byte-identical reconstruction."
+---
+
+Before any code is decompiled, the pipeline must prove that the retail loaded image can be reconstructed exactly from first principles. This happens across four stages: the splat disassembly that produces readable assembly from the binary, the binary baseline that proves the sections can be reassembled into an identical loaded image, the monolithic assembly baseline that replaces the `.text` blob with real assembled instructions, and the translation-unit split that partitions `.text` into per-TU objects — each gate building on all the ones before it.
+
+## Disassembly with splat
+
+The retail ELF is split into per-section assembly and a linker script by [splat](https://github.com/ethteck/splat), driven by `splat.yaml`. The entire loaded image is a single `PT_LOAD` segment (file offset `0x1000` maps to vram `0x00100000`), so a single splat code segment covers every loaded section.
+
+```bash
+python -m pip install -r requirements.txt   # pinned splat + backends
+python configure.py                          # disassemble into asm/ and build/
+python configure.py --check                  # split twice; prove identical output
+```
+
+`configure.py` checks that the installed disassembler exactly matches the locked versions before running `splat split`. The pinned versions are:
+
+| Package | Version |
+|---|---|
+| `splat64` | `0.41.0` |
+| `spimdisasm` | `1.42.2` |
+| `rabbitizer` | `1.16.2` |
+
+splat consumes the `symbol_addrs.txt` registry from the previous step for all function and data names. `configure.py --check` runs the entire split twice and compares every output file byte-for-byte, proving that the disassembly is a deterministic function of the input ELF alone.
+
+<Note>
+  Nothing splat produces is ever committed. All outputs are gitignored: assembly lands in `asm/`, and the generated linker script, raw section dumps (`build/assets/`), assembler macros, and undefined-symbol lists land in `build/`.
+</Note>
+
+## Binary Baseline
+
+`tools/build_baseline.py` proves that the target's loaded image can be rebuilt from per-section `.incbin` objects placed at the exact virtual addresses recorded in `linker.ld`. This is the identity reconstruction that every later matching step builds on.
+
+```bash
+python tools/build_baseline.py          # reconstruct + verify (no toolchain needed)
+python tools/build_baseline.py --link    # also link with real PS2 ee-ld
+```
+
+The tool tiles the single `PT_LOAD` segment into the loaded `PROGBITS` sections (`.text`, `.vutext`, `.data`, `.rodata`, `.lit4`, `.sdata`) and carries each as a raw `.incbin` object. It then checks two things:
+
+- **Loaded layout** — every object address and NOBITS size in `linker.ld` matches the target's section table, and the highest `.bss` address reaches the segment `memsz` end (`0x0070698C`).
+- **Packaged hash** — reconstructing the loaded image reproduces the target's `PT_LOAD` file image byte-for-byte: SHA-256 `c92a59870d47441bbd3f741eca2be42ccbbab28b7d0670d96e09c2f2340fe438`.
+
+One 0x80-byte run at `0x00293680`, between `.vutext` and `.data`, holds MIPS bytes described by no section header. It is carried as an explicit `.orphan` object so no loaded byte is ever invented. The three inter-section gaps (before `.rodata`, `.lit4`, and `.sdata`) are all-zero and recreated as linker fill.
+
+The default run is pure Python and needs no toolchain. `--link` assembles and links with the locked PS2 binutils (Linux x86-64; run inside the Containerfile image on non-Linux hosts) and confirms the real `ee-ld` output's loaded image carries the same packaged SHA-256. Nothing game-derived is committed — the extracted `.bin` blobs, generated `.s`/`.o`, and the linked ELF all land in gitignored `build/baseline/`.
+
+## Monolithic Assembly Baseline
+
+The next stage replaces the `.text` blob with real assembled instructions. `tools/assemble_text.py` assembles splat's whole-program `.text` disassembly (`asm/text.s`), links it at the target's `.text` address, and proves the result is byte-identical to the retail `.text`.
+
+```bash
+python tools/assemble_text.py    # assemble asm/text.s, link, compare .text
+```
+
+The tool runs five checks in order:
+
+1. **Disambiguate duplicate statics** — four static functions (`ReadNuIFFGeomSkin`, `ReadNuIFFGeomVtx`, `NuNodeRead`, `_fpadd_parts`) share a name across two translation units each. Each definition is renamed to `NAME__<vram>` and each `jal` is repointed to the definition its encoding already targets. No instruction byte moves.
+2. **Assemble** — the transformed text assembles with the locked PS2 `as` (`-march=r5900`).
+3. **Resolve external symbols** — every symbol referenced but not defined in `asm/text.s` is resolved to its true address from the committed `.mdebug` registry, splat's auto lists, or (for address-named auto symbols like `D_00633400`) the name itself.
+4. **Link** — `.text` is placed at `0x00100000` with those symbols defined.
+5. **Assembled `.text` byte-identical** — the linked `.text` equals the retail `.text` byte-for-byte: SHA-256 `25e07defbc3617ff1502295a050c8fea1ee0c5a6d0e52838e82d6b7b3abf63e5`.
+
+Like the `--link` mode of the binary baseline, this stage requires the PS2 binutils on Linux x86-64; run it inside the Containerfile image on other hosts. Nothing game-derived is committed — the transformed `.s`, the object, the link script, and the linked ELF all land in gitignored `build/baseline/`.
+
+## Translation-Unit Split
+
+The final structural step splits the monolithic `.text` into one assembly object per translation unit, following the boundaries the retail `.mdebug` records, and proves the whole loaded image still links exactly. `tools/split_text.py` drives it:
+
+```bash
+python tools/split_text.py
+```
+
+The `.mdebug` procedure table gives **247 translation units** that own `.text` code (out of 267 total); each becomes its own `.s` object. The six non-`.text` sections stay as `.incbin`, exactly as in the binary baseline. The tool checks five things in order:
+
+1. **Disambiguate duplicate statics** — reuses the monolithic baseline's byte-lossless `NAME__<vram>` rename.
+2. **Drop no-op `.align` directives** — the disassembly covers `.text` with one explicit instruction word per four bytes and no address gaps, so every `.align` is a no-op. Dropping them makes each TU a pure instruction stream, ensuring the 11 TUs that start at a 4-aligned (not 8-aligned) address assemble correctly.
+3. **Split lossless** — the per-TU bodies are a strict, order-preserving partition of the monolithic body: same lines, nothing added or dropped.
+4. **Assemble / resolve / link** — every TU is assembled separately, all external symbols resolved to their true addresses, and the objects linked with the six `.incbin` sections via `SUBALIGN(1)` (pure concatenation) into the full `PT_LOAD` image.
+5. **Linked image matches packaged hash** — the reconstructed loaded image is byte-identical: SHA-256 `c92a59870d47441bbd3f741eca2be42ccbbab28b7d0670d96e09c2f2340fe438` — the same packaged hash the binary baseline established.
+
+<Note>
+  Nothing game-derived is committed from this stage either. The 247 per-TU `.s` files, their objects, the `.incbin` blobs, the link script, and the final linked ELF all land in gitignored `build/split/`. The split and lossless checks are pure Python and run on any platform; assembling and linking requires the PS2 binutils in the Containerfile image.
+</Note>

@@ -1,0 +1,141 @@
+---
+title: "Data Symbol Matching Workflow"
+sidebarTitle: "Data Workflow"
+description: "How to match data symbols after all functions in a unit are matching: types, initialisers, promote.py --init-data, and whole-unit completion."
+---
+
+Once every function in a translation unit reaches `matching`, the unit is eligible for data work — moving named data symbols from borrowed retail bytes into C definitions under their retail names. The data workflow is a structured sequence: establish a snapshot baseline, identify candidates, resolve types, add initialisers, byte-verify each symbol with `compile_diff`, promote with `promote.py`, and finally promote the whole unit to `complete` mode when every symbol is done. This page covers each step in order.
+
+## Preconditions
+
+Before beginning data work on a unit:
+
+- Every `[[function]]` entry in the unit's status manifest must be `matching`
+- The unit must not be in any open `decomp/*` pull request or running batch
+- No `NW_HOST` PR may currently touch the unit
+
+## Global-Symbol Policy
+
+C may define a global data symbol only when **all** of the following hold:
+
+1. The unit is fully matching (every `[[function]]` is `matching`)
+2. It is a registry symbol of that unit, defined under its retail name and storage (`static` where retail is static; `const` for `.rodata`; a function static inside the function that references it)
+3. Its section is `.rodata`, `.data`, or `.sdata` — or `.sbss`/`.bss` for an uninitialised object in a `complete` unit
+4. `promote_matching` (via `tools/promote.py`) has verified it: bytes over `[addr, addr+size)` and linked address equal retail
+
+Everywhere else — partially matched units, COMMON — reference retail data with registered names or `extern D_…` symbols taken from the PS2 disassembly, `target-asm`, `asm/text.s`, or `config/pal103/symbol_addrs.txt`, with readable aliases:
+
+```c
+extern struct nulsthdr_s *D_006309FC;
+#define sceneinst_pool D_006309FC
+```
+
+<Warning>
+Never set `state = "retail"` or `state = "matching"` by hand. Only `tools/promote.py` writes these states, after byte verification. Setting them manually bypasses the verification gate and will cause CI failures.
+</Warning>
+
+## Per-Unit Data Workflow
+
+<Steps>
+  <Step title="Snapshot the base (step 0)">
+    Branch off an up-to-date `main`. Regenerate the build graph and capture a codegen snapshot on the base so you can prove later that the data work changed no `.text` bytes in any other unit:
+
+    ```bash
+    python tools/gen_ninja.py
+    python tools/check_codegen.py --build --snapshot
+    ```
+
+    Wait for the snapshot to complete before making any source changes.
+  </Step>
+  <Step title="Initialise the data table">
+    Use `list_data_candidates` to identify which data symbols to tackle first, then `get_context <data id>` for the authoritative dossier on each symbol. Once you know which symbols to define, initialise the `[[data]]` table in the unit's status manifest:
+
+    ```bash
+    python tools/promote.py --init-data src/<unit>.c
+    ```
+
+    This adds the `[[data]]` table scaffolding populated with the unit's registry symbols at `state = "asm"`.
+  </Step>
+  <Step title="Resolve types">
+    Determine the C type for each data symbol in this order of preference:
+
+    1. **STABS** — use the `type` field from the data registry (`config/pal103/data_symbols.toml`)
+    2. **Shared headers and existing extern types** — check `include/` and the extern types the matched C already compiles against
+    3. **GC DWARF names** — only when the size from GC DWARF matches the `.symtab` size exactly
+    4. If none of the above resolves the layout, record a `missing_type_layout` blocker and stop for that symbol
+  </Step>
+  <Step title="Generate initialisers">
+    Use `dump_data.py` to decode the retail bytes into C initialiser syntax:
+
+    ```bash
+    python tools/dump_data.py <data id> [--type '<C type>']
+    ```
+
+    For struct types, add `--probe` to let the tool suggest a type. For float literals, add `--verify` to confirm that the float round-trips to the same bytes:
+
+    ```bash
+    python tools/dump_data.py <data id> --type 'struct foo_s' --probe
+    python tools/dump_data.py <data id> --type 'f32' --verify
+    ```
+  </Step>
+  <Step title="Add the definition">
+    Replace the `extern D_` declaration and `#define` alias with a full definition under the retail name, placed in address order within the file:
+
+    - `static` where retail is static
+    - `const` for `.rodata` symbols
+    - Function statics placed inside the function whose code references them
+    - Rename all alias use sites within the unit to the retail name; other units keep their `extern`
+
+    Raw binary assets (e.g. font bitmaps) keep `state = "retail"` with a `reason`, set by hand the same way `equivalent` is set — human review only.
+  </Step>
+  <Step title="Byte-verify with compile_diff">
+    Run `compile_diff` for each data symbol until `exact = true`:
+
+    ```bash
+    python -m tools.decomp_agent.cli compile-diff <data id>
+    ```
+
+    Or via the MCP tool: `compile_diff` with the data id as `target`. If `compile_diff` reaches 100% but the hybrid build fails with "data section in compiler output not supported yet", a file-scope definition slipped into a unit without a `[[data]]` table — replace it with the extern form.
+  </Step>
+  <Step title="Promote the data symbols">
+    Once each symbol is exact, promote them. This run is long; run it in the background:
+
+    ```bash
+    python tools/promote.py <data id> [<data id> …]
+    ```
+  </Step>
+  <Step title="Complete the unit (if it qualifies)">
+    If every function and every data entry in the unit is done, promote the unit to whole-unit (`complete`) mode:
+
+    ```bash
+    python tools/promote.py --complete pal103:unit-NNNN
+    ```
+
+    `complete = true` is **only** written by `promote.py --complete`, after the verifier proves: every function and data entry is done, and the unit's whole-unit hybrid supplies every range the unit owns with bytes equal to retail and every `.sbss`/`.bss` object at its address.
+  </Step>
+  <Step title="Verify no other units changed">
+    Confirm that only this unit's data objects changed and nothing else regressed:
+
+    ```bash
+    python tools/check_codegen.py --build --compare
+    ```
+
+    Only this unit's objects should differ (data pieces; `.text` must be identical), with 0 differences elsewhere. Then run the full check suite:
+
+    ```bash
+    python tools/dispatch.py ninja check
+    python tools/status.py --check
+    python tools/check_types.py --check
+    ```
+  </Step>
+</Steps>
+
+## Section Order
+
+<Note>
+Process data symbols in section order: `.rodata` first, then `.data`, then `.sdata`. The `.sbss` and `.bss` uninitialised objects receive their definitions alongside the rest in address order but are promoted only by `promote.py --complete`, not by individual `promote.py <data id>` calls. Compiler-private data (string literals, aggregate temporaries, jump tables) and the `.lit4` float pool stay borrowed until `--complete` switches the unit to whole-unit mode.
+</Note>
+
+## What `complete = true` Enables
+
+When `promote.py --complete` succeeds, the unit enters whole-unit mode. `gen_hybrid` lays the unit's data out the way the original assembler did — each data section in retail function order, one `.lit4` slot per pool-bound `li.s`, one 8-byte `.rodata` literal per `li.d $gpr` that is not built inline — and anchors each section where the code's and data pointers' retail references put it. The unit's `.sbss`/`.bss` objects come from C too (pieces without file bytes): `ee-gcc` writes an uninitialised static as label, `.align`, `.space`. Bytes the unit emits past its own ranges (jump tables, strings after its last code reference) lie in data-map gaps and are recorded as `[[claim]]` entries (`section`, `start`, `end`). Re-run `--complete` after any C change that moves claimed spans.

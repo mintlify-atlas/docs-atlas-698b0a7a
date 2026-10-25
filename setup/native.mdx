@@ -1,0 +1,105 @@
+---
+title: "Native Linux Setup for CrashWOC Decomp PS2"
+sidebarTitle: "Native Linux"
+description: "Run the CrashWOC Decomp PS2 toolchain natively on Linux or WSL2, skipping Docker. Requires i386 multilib and the CRASHWOC_DIRECT=1 env var."
+---
+
+On a Linux x86-64 host — or Windows via WSL2 — you can run the EE GCC toolchain binaries directly without a container. This avoids the Docker overhead and makes it easier to profile or inspect compiler invocations, but it requires a small amount of host setup: i386 multilib libraries for the 32-bit `ee-gcc-tt` compiler, and the `CRASHWOC_DIRECT=1` environment variable that tells `tools/dispatch.py` to execute toolchain commands in-process rather than forwarding them into a container.
+
+<Note>
+  This path is for **Linux x86-64 and WSL2 only**. The matching toolchain binaries are Linux ELFs. macOS and plain Windows (without WSL2) cannot run them natively and must use the [Docker setup](/setup/docker) instead.
+</Note>
+
+## Prerequisites
+
+- **Linux x86-64** host or **Windows with WSL2** (Ubuntu 22.04 or later recommended)
+- **Python 3.12 or newer**
+- `sudo` access to install system packages
+- A **legal personal copy** of *Crash Bandicoot: The Wrath of Cortex* (PAL build `SLES_503.86`) placed at `orig/pal103/`
+
+## Setup
+
+<Steps>
+  <Step title="Install Python dependencies">
+    Install the pinned Python packages for the disassembler (`splat64`, `spimdisasm`, `rabbitizer`) and the optional MCP server SDK:
+
+    ```bash
+    python -m pip install -r requirements.txt -r requirements-mcp.txt
+    ```
+
+    `requirements.txt` pins `splat64==0.41.0`, `spimdisasm==1.42.2`, and `rabbitizer==1.16.2`. These versions are mirrored in `toolchain.lock.json` and verified by `configure.py` at run time — a version mismatch will be caught before any split or build runs.
+  </Step>
+
+  <Step title="Enable i386 multilib">
+    The SN ProDG `ee-gcc-tt` compiler is a Win32 PE executable run under `wibo`, a minimal Win32 loader. `wibo` itself is a Linux x86-64 binary but the compiler it loads contains 32-bit x86 code, so the host needs i386 runtime libraries:
+
+    ```bash
+    sudo dpkg --add-architecture i386
+    sudo apt-get update && sudo apt-get install -y libc6:i386 libstdc++6:i386 zlib1g:i386
+    ```
+
+    On non-Debian distributions, install the equivalent 32-bit glibc and libstdc++ packages for your package manager.
+  </Step>
+
+  <Step title="Download and verify the locked toolchain">
+    ```bash
+    python tools/setup_toolchain.py --download
+    ```
+
+    This fetches every component listed in `toolchain.lock.json` (both EE GCC compilers, `wibo`, `ps2-binutils`, and `objdiff-cli`), verifies each downloaded archive against its locked SHA-256, and installs the files under `compiler/`. It will refuse to install any archive whose hash is not yet recorded in the lock file.
+
+    After installation, record a per-file fingerprint manifest so that future runs can catch silent codegen-affecting changes:
+
+    ```bash
+    python tools/fingerprint_compiler.py --record
+    ```
+  </Step>
+
+  <Step title="Set CRASHWOC_DIRECT=1">
+    ```bash
+    export CRASHWOC_DIRECT=1
+    ```
+
+    This environment variable tells `tools/dispatch.py` to run toolchain commands **in-process** on the local host instead of forwarding them into a container. Without it, `dispatch.py` assumes a Docker/Podman container is the execution target and will attempt to reach one.
+
+    Add this line to your shell's rc file (`.bashrc`, `.zshrc`, etc.) to make it permanent.
+  </Step>
+
+  <Step title="Run the full setup pipeline">
+    ```bash
+    python decomp.py setup
+    ```
+
+    With `CRASHWOC_DIRECT=1` set, every toolchain invocation runs natively. The pipeline verifies `orig/`, splits the target ELF, compiles hybrid objects, runs byte verification, and generates the progress report. Re-running is safe; only changed files are rebuilt.
+
+    Once setup finishes, open the repository root in the **objdiff GUI** for live per-function match feedback, then start working on a unit:
+
+    ```bash
+    python decomp.py src/game/creature.c
+    ```
+  </Step>
+</Steps>
+
+## How `CRASHWOC_DIRECT=1` works
+
+`tools/dispatch.py` is the thin layer between `decomp.py` and the actual toolchain binaries. In its default mode it detects or starts a `crashwoc-dev-<hash>` container and proxies every compiler and assembler call into it. Setting `CRASHWOC_DIRECT=1` flips a single branch in `dispatch.py`: it skips all container logic and executes the local `compiler/` binaries directly. Everything else — argument handling, working directory, environment variables passed to the compiler — remains identical between the two modes.
+
+<Warning>
+  If you unset `CRASHWOC_DIRECT` after running natively, `decomp.py` will revert to container mode. Make sure Docker or Podman is running before doing so, or re-export the variable.
+</Warning>
+
+## Validating the environment
+
+These pure-Python checks require no toolchain and can confirm the environment is healthy before you start:
+
+```bash
+python -m unittest discover -s tests -v      # all unit tests
+python tools/status.py --check               # status manifests are well-formed
+python tools/verify_target.py                # orig/ matches the committed registry
+```
+
+The fingerprint check verifies every installed compiler file byte-for-byte against the recorded manifest — useful after any system update:
+
+```bash
+python tools/fingerprint_compiler.py --all
+```

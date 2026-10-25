@@ -1,0 +1,79 @@
+---
+title: "CrashWOC Decomp PS2: Byte-Exact PS2 Decompilation"
+sidebarTitle: "Introduction"
+description: "Learn what CrashWOC Decomp PS2 is, why byte-exact matching matters, and how the project is structured around a single PAL retail target."
+---
+
+CrashWOC Decomp PS2 is a byte-exact matching decompilation of **Crash Bandicoot: The Wrath of Cortex** for the PlayStation 2. The goal is to reconstruct the retail executable entirely from hand-written C — code that, when compiled with the original toolchain, produces the *exact same bytes* as the shipped disc. This is not a reverse-engineering effort focused on readability alone: every function must produce a bit-perfect binary match against the retail build before it can be marked as verified. The project begins from the `.mdebug` symbol table embedded in the unstripped retail ELF, which records every translation unit and procedure at the address it occupied on disc, giving an unusually precise starting scaffold for reconstruction work.
+
+## What Byte-Exact Matching Means
+
+A decompilation is "byte-exact" when the hand-written C source, compiled with the original compiler and flags, produces an output object whose bytes are identical to the corresponding slice of the retail executable. A fuzzy percentage score from objdiff is a guide and a measurement tool — but it is never accepted as proof. The only canonical truth is re-deriving the bytes: `tools/promote.py` runs the full byte verification pipeline before it will ever write `state = "matching"` to a manifest, and `tools/verify_promoted.py` re-proves every existing `matching` claim independently. No function moves from `asm` to `matching` by a human hand-editing a file.
+
+## The Single Target Build
+
+All matching work targets exactly one build of the game. There is no multi-region, no NTSC variant, no alternative version — every byte of reconstructed code is measured against this single executable:
+
+| Property | Value |
+|---|---|
+| **Title** | Crash Bandicoot: The Wrath of Cortex |
+| **Region / Version** | PAL retail v1.03 |
+| **Product code** | SLES-50386 (`SLES_503.86`) |
+| **SHA-256** | `7fc6826d08c42a5a92fc018edae3e520783beb5a8330410251192bfe26b1eca1` |
+| **File size** | 6,731,763 bytes |
+
+The `SYSTEM.CNF` companion file (56 bytes, SHA-256 `86fe327e4576516f57004800b2663c75c8a65a62872f3fdf3aa0618daf23d9c1`) is also required for setup. Both files are verified against these exact values before any build step proceeds.
+
+<Note>
+This repository contains no game assets, no game code, and no copyrighted binaries. It is a clean-room reconstruction workspace. All original files must be supplied by the user from their own legally obtained copy of the game and placed at `orig/pal103/`. These files are never committed.
+</Note>
+
+## Project Structure
+
+The repository is organized so that every committed file is either human-authored source, tooling, or a registry derived purely from the structure of the retail ELF — never game bytes themselves.
+
+<CardGroup cols={2}>
+  <Card title="src/" icon="code">
+    Hand-written C source files — the actual decompilation work product. Each file corresponds to one translation unit in the retail executable. Nothing here is generated; all of it is human-authored and committed.
+  </Card>
+  <Card title="config/pal103/" icon="database">
+    Registries and status manifests extracted from the retail ELF: `units.toml` (267 translation units), `functions.toml` (3,751 procedures), `symbol_addrs.txt` (6,318 symbols), and per-unit `status/` manifests tracking each function's state.
+  </Card>
+  <Card title="tools/" icon="wrench">
+    The full build toolchain: `decomp.py` (the main entry point), `promote.py` (the only writer of `state = "matching"`), `verify_promoted.py`, `gen_hybrid.py`, `setup_toolchain.py`, and all supporting scripts. These are the engine behind every match check.
+  </Card>
+  <Card title="include/" icon="file-code">
+    Shared headers used across the hand-written C source. Contains type definitions, macros, and declarations that mirror the original SDK and engine interfaces needed for the reconstruction.
+  </Card>
+</CardGroup>
+
+## Completion Levels
+
+Progress in the project is tracked against three distinct milestones, each representing a stricter definition of "done":
+
+1. **Loaded-image exact** — every runtime-relevant byte and address matches the retail disc: all allocated sections, the entry point at `0x00100008`, `_gp` at `0x00634970`, and the program headers. This is the primary technical goal, proven by SHA-256 `c92a59870d47441bbd3f741eca2be42ccbbab28b7d0670d96e09c2f2340fe438` on the reconstructed `PT_LOAD` image.
+2. **Packaged ELF exact** — the generated `SLES_503.86` has the exact retail SHA-256, including the ELF header and all section metadata.
+3. **Pure relink exact** — every ELF byte, including `.mdebug`, `.stab`, `.symtab`, and all linker metadata, is fully regenerated. This is the final archival goal.
+
+## Two-Compiler Setup
+
+The retail ELF was built by two different compilers, and matching work uses both — each for the half of the program it actually compiled. The split is identified by the calling conventions observable in the binary: `sq`/`lq` callee saves at 16-byte slots with no R5900 short-loop padding belong to the SN ProDG build, while `sd`/`ld` saves with short-loop padding belong to the Sony runtime build.
+
+| Profile | Compiler | Covers |
+|---|---|---|
+| `default` | SN ProDG **EE GCC 2.95.2-EE** (`ee-gcc-tt`) | Game and Nu-engine translation units — the active decompilation target |
+| `sce` | Sony **EE GCC 2.9-ee-991111-01** (`ee-gcc`) | Sony runtime: SCE libraries, newlib, libgcc, and the CRT |
+
+The `default` profile compiles with `-O2 -G8 -fomit-frame-pointer`; `sce` with `-O2 -G0 -fomit-frame-pointer`. Every unit uses `default` unless its status manifest names a different profile explicitly. Modern compilers are used only for analysis and tooling, never for matching results.
+
+All tools and compilers are pinned by version and SHA-256 in `toolchain.lock.json`. Every installed compiler file is additionally verified byte-for-byte against a recorded fingerprint manifest, so a same-version reinstall that would silently change codegen is caught before it can corrupt a match result.
+
+<Tip>
+Once setup is complete, open the repository in the **objdiff GUI** for live per-function match feedback as you work. The `objdiff.json` file generated by `python decomp.py setup` exposes all 247 `.text` translation units, each diffed against its expected retail object. Visit the [objdiff releases page](https://github.com/encounter/objdiff/releases) to download the GUI for your platform.
+</Tip>
+
+## Community
+
+The project is part of the broader Crash Bandicoot modding community. Come discuss decompilation progress, ask for help getting set up, or collaborate on specific translation units:
+
+**The Wrath of Cortex Modding Discord:** [https://discord.gg/QqQtEfKC2V](https://discord.gg/QqQtEfKC2V)

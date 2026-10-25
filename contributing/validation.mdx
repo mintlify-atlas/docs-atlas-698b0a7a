@@ -1,0 +1,121 @@
+---
+title: "Validating the Repo Before Opening a PR"
+sidebarTitle: "Validation"
+description: "Run the full set of validation gates locally before opening a PR: unit tests, manifest checks, registry checks, and byte-gate commands."
+---
+
+Before opening a pull request, run the validation gates described on this page to confirm that the repository is self-consistent. The gates are divided into two tiers: **structure-only gates** that are pure Python and run on any OS without game files or a toolchain, and **byte-matrix gates** that require both the retail ELF and the matching toolchain. CI runs the same commands — `validate.yml` runs the structure gates on every push and PR; `matching.yml` runs the byte matrix inside the private container image.
+
+<Warning>
+  **Never hand-edit a manifest to `state = "matching"`**. Only `tools/promote.py` writes that value, after byte verification. A manually promoted entry corrupts the hybrid object and fails `verify-promoted` in CI. See [Workflow](/contributing/workflow) for the full state lifecycle.
+</Warning>
+
+## Structure-only gates
+
+These commands are pure Python — no toolchain, no game files, any OS. Run them all before opening a PR; `validate.yml` runs the same set on every push and pull request.
+
+<Accordion title="Unit tests">
+  Runs the full Python test suite under `tests/`.
+
+  ```bash
+  python -m unittest discover -s tests -v
+  ```
+
+  Every test must pass. If a test failure only affects a tool you haven't touched, mention it in your PR so a maintainer can triage it separately.
+</Accordion>
+
+<Accordion title="Status manifest check">
+  Validates that every status manifest in `config/pal103/status/` is well-formed: required fields present, states are one of `asm`/`equivalent`/`matching`, no orphaned function names, and `complete` units satisfy their additional constraints.
+
+  ```bash
+  python tools/status.py --check
+  ```
+</Accordion>
+
+<Accordion title="Target hash check (needs orig/)">
+  Checks file sizes, SHA-1 and SHA-256 hashes, the parsed `SYSTEM.CNF` values, and every field of the ELF header, program headers, and section header table against the committed registry. Every line must read `PASS`.
+
+  ```bash
+  python tools/verify_target.py
+  ```
+
+  <Note>
+    This gate requires your legal copy of the game to be in place at `orig/pal103/`. See the README for the exact build identifier and expected hashes.
+  </Note>
+</Accordion>
+
+<Accordion title="mdebug registry check (needs orig/)">
+  Re-extracts the MIPS ECOFF debug section from the retail ELF and verifies that the committed `units.toml`, `functions.toml`, and `symbol_addrs.txt` are byte-for-byte identical to a fresh extraction.
+
+  ```bash
+  python tools/extract_mdebug.py --check
+  ```
+
+  <Note>
+    Requires `orig/pal103/`.
+  </Note>
+</Accordion>
+
+<Accordion title="Data registry check (needs orig/)">
+  Re-derives the data symbol registry (`data_symbols.toml`) from the retail ELF's `.symtab` and `.mdebug` sections and confirms the committed file matches the fresh extraction.
+
+  ```bash
+  python tools/extract_data_symbols.py --check
+  ```
+
+  <Note>
+    Requires `orig/pal103/`.
+  </Note>
+</Accordion>
+
+<Accordion title="Data map check (needs orig/)">
+  Re-derives the exact tiling of data sections into per-unit ranges (`data_map.toml`) and confirms it matches the committed file.
+
+  ```bash
+  python tools/extract_data_map.py --check
+  ```
+
+  <Note>
+    Requires `orig/pal103/`.
+  </Note>
+</Accordion>
+
+<Accordion title="Disassembly determinism check (needs orig/ + splat)">
+  Runs `splat split` twice from scratch and verifies every output file is byte-for-byte identical between the two runs, proving the disassembly is a deterministic function of the retail ELF.
+
+  ```bash
+  python configure.py --check
+  ```
+
+  <Note>
+    Requires `orig/pal103/` and the pinned splat version from `requirements.txt`.
+  </Note>
+</Accordion>
+
+### Running all structure gates at once
+
+The commands above are safe to paste in sequence:
+
+```bash
+python -m unittest discover -s tests -v      # all unit tests
+python tools/status.py --check               # status manifests are well-formed
+python tools/verify_target.py                # orig/ matches committed registry (needs orig/)
+python tools/extract_mdebug.py --check       # registries == fresh extraction (needs orig/)
+python tools/extract_data_symbols.py --check # data registry == fresh extraction (needs orig/)
+python tools/extract_data_map.py --check     # data map == fresh extraction (needs orig/)
+python configure.py --check                  # disassembly is deterministic (needs orig/ + splat)
+```
+
+## Byte-matrix gates (toolchain required)
+
+The full byte matrix — compile, `verify-loaded`, and `verify-promoted` — requires the locked PS2 EE GCC toolchain and the retail ELF. These run inside the container (or natively in the Option B environment described in CONTRIBUTING.md) via `tools/dispatch.py`:
+
+```bash
+python tools/dispatch.py ninja check
+```
+
+This single target builds the current compile, runs the full loaded-image hash check against the retail SHA-256, and re-derives every `state = "matching"` claim from scratch. It is equivalent to running `verify-loaded` and `verify-promoted` in sequence.
+
+<Tip>
+  If you don't have the toolchain installed locally, you can skip the byte gates and let CI run them on your pushed branch. Every push to an in-repo branch triggers `matching.yml`, which uploads a `SLES_503.86_report` artifact and posts a decomp.dev progress comment on any open PR. See [CI](/contributing/ci) for how the two workflows are structured.
+</Tip>

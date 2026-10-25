@@ -1,0 +1,70 @@
+---
+title: "Symbol Registries: Functions, Data, and Debug Info"
+sidebarTitle: "Registries"
+description: "How symbol registries are extracted from the retail .mdebug ECOFF debug section and .symtab, and what each registry file contains."
+---
+
+The retail `SLES_503.86` executable ships a complete MIPS ECOFF debug section — `.mdebug`, magic `0x7009` — that describes every translation unit and procedure in the program, including their virtual addresses, stack-frame sizes, and saved-register masks. Because the game's ELF was never stripped, this information is authoritative and exhaustive. The project extracts it deterministically into committed registry files that every later pipeline stage depends on; nothing is guessed or inferred.
+
+## Function and Unit Registries (`.mdebug`)
+
+`tools/extract_mdebug.py` reads the `.mdebug` section straight from the retail binary, in native table order, and emits three registry files:
+
+| File | Entries | Contents |
+|---|---|---|
+| `config/pal103/units.toml` | 267 | translation units (file descriptors) |
+| `config/pal103/functions.toml` | 3,751 | procedures (address, frame, register masks) |
+| `config/pal103/symbol_addrs.txt` | 6,318 | splat-style `name = address` (functions + data) |
+
+Every address in these files is read or computed directly from the ECOFF tables (`fdr.adr + pdr.adr`). Global data addresses in `symbol_addrs.txt` are cross-checked against the allocated section ranges in `config/pal103/sections.json` so that an ECOFF `value` that encodes a size rather than an address can never be emitted as one. Executable sections are excluded, except `.vutext`, whose VU1 microcode packages the EE code handles as data.
+
+```bash
+python tools/extract_mdebug.py           # (re)generate the registries
+python tools/extract_mdebug.py --check   # verify committed == fresh extraction
+```
+
+The `--check` mode regenerates the entire output from the binary and compares it byte-for-byte against the committed files, proving the extraction is a pure function of the input ELF.
+
+## Data Registries (`.symtab` and STABS)
+
+Two additional registries describe the data sections. Both are `--check`-gated in the same way as the function registries above, and both are pure functions of the retail executable — the unstripped `.symtab` provides what `.mdebug` does not:
+
+| File | Entries | Contents |
+|---|---|---|
+| `config/pal103/data_symbols.toml` | 3,750 | one `[[symbol]]` per named data symbol |
+| `config/pal103/data_map.toml` | 679 | exact tiling of data sections into per-unit ranges |
+
+```bash
+python tools/extract_data_symbols.py           # (re)generate the data registry
+python tools/extract_data_symbols.py --check   # verify committed == fresh extraction
+python tools/extract_data_symbols.py --stats   # census (sizes, STABS types, name clashes)
+python tools/extract_data_map.py --check       # verify data map == fresh extraction
+```
+
+### data_symbols.toml
+
+Each `[[symbol]]` entry holds every data global the external symbol table defines, and every file-local static of a unit's local symbol run. Linker symbols such as `_gp` and `_fbss` are excluded. The key fields per entry are:
+
+| Field | Rule |
+|---|---|
+| `key` | `unit-NNNN:<name>`, unique (25 static names repeat across units) |
+| `name`, `unit` | retail name (function statics keep their `.N` suffix); owning unit |
+| `scope` | `global`, `static`, or `function_static` |
+| `address`, `section` | section derived from the address, never from the storage class (`errno` is `scBss` in `.sbss`) |
+| `size`, `extent` | `.symtab` `st_size` when > 0; `extent` is the upper bound to the next attributed item including padding |
+| `type`, `stab` | C type rebuilt from STABS, and the raw stab string (130 symbols; only `sce` units carry STABS) |
+
+### data_map.toml
+
+The data map tiles `.data`, `.rodata`, `.lit4`, `.sdata`, `.sbss`, `.bss`, and the 0x80-byte orphan run at `0x00293680` exactly. Every byte is attributed to exactly one unit or marked `unassigned`. Each range carries an `evidence` field explaining why it was assigned:
+
+| `evidence` | Meaning |
+|---|---|
+| `mdebug` | the unit's named symbols prove ownership (code references may extend the run) |
+| `xref` | only the unit's code references the range (`.rodata` strings, jump tables, `.lit4` pools) |
+| `gap` | nothing attributes the bytes |
+| `orphan` | the un-sectioned 0x80-byte run at `0x00293680` |
+
+<Note>
+  TOML has no null type. An absent key in any registry file means the value is unknown — nothing is guessed or defaulted. If a field is not present, the information was not available in the retail binary.
+</Note>
